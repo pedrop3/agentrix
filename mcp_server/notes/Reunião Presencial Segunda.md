@@ -1,0 +1,1 @@
+Lembrança: Tenho que comparecer de forma presencial na segunda-feira.

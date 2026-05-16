@@ -1,0 +1,1 @@
+Este é um resumo do projeto X, com foco no prazo final em junho.

@@ -1,0 +1,1 @@
+Lembrar de ir trabalhar presencialmente na próxima segunda-feira.
