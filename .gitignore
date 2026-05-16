@@ -1,3 +1,19 @@
-/.idea/
-/.venv/
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.python-version
+
+# Env
+.env
+.env.*
+
+# Dados gerados em runtime
+mcp_server/notes/
+memory.db
 

@@ -14,6 +14,8 @@ from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, MessagesState, StateGraph
 from pydantic import BaseModel, Field
 
+from logger import LLMLogger
+
 
 # ---------------------------------------------------------------------------
 # Schema da decisao do supervisor (structured output)
@@ -49,7 +51,7 @@ You MUST return valid JSON with fields {"next": "...", "reason": "..."}.
 # ---------------------------------------------------------------------------
 def build_supervisor(model_name: str = "qwen2.5:7b"):
     """Returns a model that produces a RouterDecision via structured output."""
-    model = ChatOllama(model=model_name, temperature=0, num_ctx=8192)
+    model = ChatOllama(model=model_name, temperature=0, num_ctx=8192, callbacks=[LLMLogger("supervisor")])
     return model.with_structured_output(RouterDecision)
 
 
@@ -59,7 +61,7 @@ class SupervisorState(MessagesState):
     next: str
 
 
-def build_graph(researcher, writer, mathy, supervisor):
+def build_graph(researcher, writer, mathy, supervisor, checkpointer=None):
     def supervisor_node(state: SupervisorState):
         last = state["messages"][-1]
         if getattr(last, "name", None) in ("researcher", "writer", "mathy"):
@@ -102,4 +104,4 @@ def build_graph(researcher, writer, mathy, supervisor):
     workflow.add_edge("writer", "supervisor")
     workflow.add_edge("mathy", "supervisor")
 
-    return workflow.compile()
+    return workflow.compile(checkpointer=checkpointer)

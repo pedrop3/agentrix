@@ -2,6 +2,8 @@
 from langchain_ollama import ChatOllama
 from langgraph.prebuilt import create_react_agent
 
+from logger import LLMLogger
+
 PROMPT = """You are a writer agent. Your ONLY job is to save notes for the user.
 
 Rules:
@@ -13,6 +15,6 @@ Rules:
 
 
 def build_writer(tools, model_name: str = "qwen2.5:7b"):
-    model = ChatOllama(model=model_name, temperature=0, num_ctx=8192)
+    model = ChatOllama(model=model_name, temperature=0, num_ctx=8192, callbacks=[LLMLogger("writer")])
     my_tools = [t for t in tools if t.name == "save_note"]
     return create_react_agent(model, tools=my_tools, prompt=PROMPT)
