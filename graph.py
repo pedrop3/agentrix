@@ -84,9 +84,11 @@ def build_graph(researcher, writer, mathy, supervisor, direct, checkpointer=None
         print(f"[supervisor] -> {decision.next}  ({decision.reason})")
         return {"next": decision.next}
 
-    def direct_node(state: SupervisorState):
+    async def direct_node(state: SupervisorState):
+        # async + ainvoke garante que os tokens sao emitidos via astream/astream_events
+        # (necessario para o /chat/stream do server.py).
         messages = [SystemMessage(content=DIRECT_PROMPT), *state["messages"]]
-        response = direct.invoke(messages)
+        response = await direct.ainvoke(messages)
         return {"messages": [AIMessage(content=response.content, name="direct")]}
 
     def _wrap(sub_agent, name: str):

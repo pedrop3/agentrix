@@ -39,6 +39,43 @@ Stack: LangGraph + LangChain + Ollama + MCP.
    python main.py
    ```
 
+## Servidor HTTP (FastAPI + SSE)
+
+Pra plugar uma UI (ex.: `react-chat-ui`) no switchboard, suba o servidor:
+
+```
+python server.py
+# ou:
+uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Endpoints:
+
+- `POST /chat` — resposta JSON única `{ "reply": "..." }`
+- `POST /chat/stream` — Server-Sent Events com `data: {"delta": "..."}` por token, terminando em `data: [DONE]`
+- `POST /upload` — multipart (placeholder; qwen2.5 não é multimodal)
+- `GET  /health` — status do servidor
+
+Payload esperado em `/chat` e `/chat/stream`:
+
+```json
+{
+  "conversationId": "uuid",
+  "messages": [{ "role": "user", "content": "..." }],
+  "attachments": []
+}
+```
+
+O `conversationId` é mapeado pro `thread_id` do `AsyncSqliteSaver`, então cada conversa do chat UI vira uma thread persistida no `memory.db`.
+
+Teste rápido com `curl`:
+
+```
+curl -N -X POST http://localhost:8000/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"conversationId":"demo","messages":[{"role":"user","content":"quanto e 2+2?"}]}'
+```
+
 ## Arquitetura
 
 ```
