@@ -17,7 +17,8 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from agents.mathy import build_mathy
 from agents.researcher import build_researcher
 from agents.writer import build_writer
-from graph import build_graph, build_supervisor
+from graph import build_graph, build_direct, build_supervisor
+from logger import reset_steps
 
 load_dotenv()
 
@@ -48,9 +49,10 @@ async def main():
     writer = build_writer(tools, MODEL)
     mathy = build_mathy(tools, MODEL)
     supervisor = build_supervisor(MODEL)
+    direct = build_direct(MODEL)
 
     async with AsyncSqliteSaver.from_conn_string(MEMORY_DB) as checkpointer:
-        graph = build_graph(researcher, writer, mathy, supervisor, checkpointer)
+        graph = build_graph(researcher, writer, mathy, supervisor, direct, checkpointer)
 
         print("\nSwitchboard pronto. Digite 'quit' para sair.\n")
         print("Exemplos:")
@@ -71,6 +73,7 @@ async def main():
             if user_input.lower() in {"quit", "exit", "sair"}:
                 break
 
+            reset_steps()
             result = await graph.ainvoke(
                 {"messages": [HumanMessage(content=user_input)]},
                 config=config,

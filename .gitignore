@@ -17,3 +17,5 @@ __pycache__/
 mcp_server/notes/
 memory.db
 
+memory.db-shm
+memory.db-wal

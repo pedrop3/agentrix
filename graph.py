@@ -2,10 +2,10 @@
 Supervisor + StateGraph.
 
 O supervisor olha o estado da conversa e decide o proximo passo:
-researcher / writer / mathy / END.
+researcher / writer / mathy / direct / END.
 
 Cada sub-agent, depois de rodar, volta pro supervisor — que pode encerrar
-ou roteear pra outro agent.
+ou rotear pra outro agent.
 """
 from typing import Literal
 
@@ -23,7 +23,7 @@ from logger import LLMLogger
 class RouterDecision(BaseModel):
     """Routing decision."""
 
-    next: Literal["researcher", "writer", "mathy", "END"] = Field(
+    next: Literal["researcher", "writer", "mathy", "direct", "END"] = Field(
         description="Which agent should act next, or END if the task is complete."
     )
     reason: str = Field(description="Brief reason for the decision (one sentence).")
@@ -35,15 +35,22 @@ Available agents:
 - "researcher": searches existing saved notes for information
 - "writer": saves new notes to disk
 - "mathy": performs math calculations
+- "direct": answer conversational or contextual questions — NO math allowed here
 
 Decision rules:
 - If the user asks to FIND or LOOK UP existing information -> researcher
 - If the user asks to SAVE, CREATE, or WRITE a note -> writer
-- If the user asks for a CALCULATION -> mathy
+- If the message contains ANY arithmetic, numbers to compute, or math expression -> mathy (MANDATORY, no exceptions)
+- If the question is conversational, a greeting, or can be answered from context (and contains NO math) -> direct
 - If the previous agent message already completed the user's task -> END
+
+CRITICAL: NEVER send math to "direct". Even trivial expressions like "2+2" or "3*9" MUST go to "mathy".
 
 You MUST return valid JSON with fields {"next": "...", "reason": "..."}.
 """
+
+DIRECT_PROMPT = """You are a helpful assistant. Answer the user's question directly and concisely
+using the conversation history as context. Do not use any tools."""
 
 
 # ---------------------------------------------------------------------------
@@ -55,22 +62,32 @@ def build_supervisor(model_name: str = "qwen2.5:7b"):
     return model.with_structured_output(RouterDecision)
 
 
+def build_direct(model_name: str = "qwen2.5:7b"):
+    """Returns a plain LLM for direct conversational answers."""
+    return ChatOllama(model=model_name, temperature=0, num_ctx=8192, callbacks=[LLMLogger("direct")])
+
+
 class SupervisorState(MessagesState):
     """Estado compartilhado: mensagens + proximo destino decidido."""
 
     next: str
 
 
-def build_graph(researcher, writer, mathy, supervisor, checkpointer=None):
+def build_graph(researcher, writer, mathy, supervisor, direct, checkpointer=None):
     def supervisor_node(state: SupervisorState):
         last = state["messages"][-1]
-        if getattr(last, "name", None) in ("researcher", "writer", "mathy"):
+        if getattr(last, "name", None) in ("researcher", "writer", "mathy", "direct"):
             print("[supervisor] -> END  (agent already responded)")
             return {"next": "END"}
         messages = [SystemMessage(content=SUPERVISOR_PROMPT), *state["messages"]]
         decision: RouterDecision = supervisor.invoke(messages)
         print(f"[supervisor] -> {decision.next}  ({decision.reason})")
         return {"next": decision.next}
+
+    def direct_node(state: SupervisorState):
+        messages = [SystemMessage(content=DIRECT_PROMPT), *state["messages"]]
+        response = direct.invoke(messages)
+        return {"messages": [AIMessage(content=response.content, name="direct")]}
 
     def _wrap(sub_agent, name: str):
         async def node(state: SupervisorState):
@@ -84,6 +101,7 @@ def build_graph(researcher, writer, mathy, supervisor, checkpointer=None):
 
     workflow = StateGraph(SupervisorState)
     workflow.add_node("supervisor", supervisor_node)
+    workflow.add_node("direct", direct_node)
     workflow.add_node("researcher", _wrap(researcher, "researcher"))
     workflow.add_node("writer", _wrap(writer, "writer"))
     workflow.add_node("mathy", _wrap(mathy, "mathy"))
@@ -96,10 +114,11 @@ def build_graph(researcher, writer, mathy, supervisor, checkpointer=None):
             "researcher": "researcher",
             "writer": "writer",
             "mathy": "mathy",
+            "direct": "direct",
             "END": END,
         },
     )
-    # Cada sub-agent volta pro supervisor decidir se acabou ou nao
+    workflow.add_edge("direct", "supervisor")
     workflow.add_edge("researcher", "supervisor")
     workflow.add_edge("writer", "supervisor")
     workflow.add_edge("mathy", "supervisor")
