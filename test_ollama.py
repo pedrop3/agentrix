@@ -10,7 +10,7 @@ from langchain_ollama import ChatOllama
 from langchain_core.tools import tool
 
 load_dotenv()
-MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+MODEL = os.getenv("OLLAMA_MODEL", "qwen3:14b")
 
 
 @tool
