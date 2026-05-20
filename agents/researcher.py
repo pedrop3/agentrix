@@ -14,7 +14,7 @@ Rules:
 """
 
 
-def build_researcher(tools, model_name: str = "qwen2.5:7b"):
+def build_researcher(tools, model_name: str = "qwen3:14b"):
     model = ChatOllama(model=model_name, temperature=0, num_ctx=8192, callbacks=[LLMLogger("researcher")])
     my_tools = [t for t in tools if t.name == "search_notes"]
     return create_react_agent(model, tools=my_tools, prompt=PROMPT)

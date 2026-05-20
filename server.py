@@ -3,13 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import AsyncIterator, Optional
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -18,27 +15,21 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import BaseModel
 
+from agents.knower import build_knower
 from agents.mathy import build_mathy
 from agents.researcher import build_researcher
 from agents.writer import build_writer
+from config import config
 from graph import build_direct, build_graph, build_supervisor
 from logger import reset_steps
-
-load_dotenv()
-
-MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
-PROJECT_ROOT = Path(__file__).parent
-MEMORY_DB = str(PROJECT_ROOT / "memory.db")
-RECURSION_LIMIT = int(os.getenv("AGENTRIX_RECURSION_LIMIT", "10"))
 
 # Estado global compartilhado entre requests
 runtime: dict = {}
 
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print(f"[server] Carregando modelo Ollama: {MODEL}")
+    print(f"[server] Carregando modelo Ollama: {config.ollama.model}")
     print("[server] Subindo MCP server via stdio...")
 
     client = MultiServerMCPClient(
@@ -47,21 +38,22 @@ async def lifespan(app: FastAPI):
                 "command": sys.executable,
                 "args": ["-m", "mcp_server.server"],
                 "transport": "stdio",
-                "cwd": str(PROJECT_ROOT),
+                "cwd": str(config.project_root),
             }
         }
     )
     tools = await client.get_tools()
     print(f"[server] Tools carregadas do MCP: {[t.name for t in tools]}")
 
-    researcher = build_researcher(tools, MODEL)
-    writer = build_writer(tools, MODEL)
-    mathy = build_mathy(tools, MODEL)
-    supervisor = build_supervisor(MODEL)
-    direct = build_direct(MODEL)
+    researcher = build_researcher(tools, config.ollama.researcher_model)
+    writer = build_writer(tools, config.ollama.writer_model)
+    mathy = build_mathy(tools, config.ollama.mathy_model)
+    knower = build_knower(tools, config.ollama.knower_model)
+    supervisor = build_supervisor(config.ollama.supervisor_model)
+    direct = build_direct(config.ollama.direct_model)
 
-    async with AsyncSqliteSaver.from_conn_string(MEMORY_DB) as checkpointer:
-        graph = build_graph(researcher, writer, mathy, supervisor, direct, checkpointer)
+    async with AsyncSqliteSaver.from_conn_string(config.memory_db) as checkpointer:
+        graph = build_graph(researcher, writer, mathy, supervisor, direct, knower, checkpointer)
         runtime["graph"] = graph
         runtime["mcp"] = client
         print("[server] Pronto. Endpoints: /chat /chat/stream /upload /health")
@@ -128,14 +120,18 @@ def _build_user_message(body: ChatBody) -> HumanMessage:
 def _config_for(body: ChatBody) -> dict:
     return {
         "configurable": {"thread_id": body.conversationId},
-        "recursion_limit": RECURSION_LIMIT,
+        "recursion_limit": config.recursion_limit,
     }
 
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "graph_ready": "graph" in runtime, "model": MODEL}
+    return {
+        "ok": True,
+        "graph_ready": "graph" in runtime,
+        "model": config.ollama.model,
+    }
 
 
 @app.post("/chat")
@@ -154,7 +150,7 @@ async def chat(body: ChatBody):
 async def chat_stream(body: ChatBody, request: Request):
     graph = _get_graph()
     reset_steps()
-    config = _config_for(body)
+    run_config = _config_for(body)  # nao usar `config` (shadow do modulo)
     user_msg = _build_user_message(body)
 
     async def event_source() -> AsyncIterator[bytes]:
@@ -164,7 +160,7 @@ async def chat_stream(body: ChatBody, request: Request):
             # Filtramos o supervisor (saida structured) e propagamos so o resto.
             async for chunk, metadata in graph.astream(
                 {"messages": [user_msg]},
-                config=config,
+                config=run_config,
                 stream_mode="messages",
             ):
                 if await request.is_disconnected():
@@ -211,7 +207,10 @@ async def chat_stream(body: ChatBody, request: Request):
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
-
+    """
+    Compat: o react-chat-ui usa /upload pra anexos genericos.
+    Apenas le e retorna metadata. Nao indexa.
+    """
     size = 0
     while chunk := await file.read(1024 * 64):
         size += len(chunk)
@@ -220,12 +219,89 @@ async def upload(file: UploadFile = File(...)):
         "filename": file.filename,
         "content_type": file.content_type,
         "size": size,
-        "note": "Upload recebido mas ignorado: o modelo atual nao processa imagens/arquivos.",
+        "note": "Use /documents/upload para indexar no RAG.",
     }
+
+
+@app.post("/documents/upload")
+async def documents_upload(file: UploadFile = File(...)):
+    """
+    Upload de documentos que devem ENTRAR no RAG (uploads persistentes).
+
+    Aceita: .pdf, .docx, .txt, .md (texto extraido e indexado);
+            imagens sao salvas mas nao indexadas (qwen2.5 nao e multimodal).
+
+    Retorna: { id, filename, kind, chunks, size, note? }
+    """
+    import uuid as _uuid
+    from pathlib import Path
+
+    from extract import extract
+    from rag import get_rag
+
+    data = await file.read()
+    size = len(data)
+
+    # 1) Salva o original em uploads/ (mesmo que nao seja indexado)
+    uploads_dir = Path(__file__).parent / "uploads"
+    uploads_dir.mkdir(exist_ok=True)
+    doc_id = _uuid.uuid4().hex
+    safe_name = (file.filename or doc_id).replace("/", "_").replace("\\", "_")
+    saved_path = uploads_dir / f"{doc_id}__{safe_name}"
+    saved_path.write_bytes(data)
+
+    # 2) Extrai texto conforme tipo
+    extracted = extract(data, file.filename or "", file.content_type)
+
+    # 3) Indexa no RAG se houver texto
+    chunks = 0
+    note = extracted.note
+    if extracted.text.strip():
+        try:
+            rag = get_rag()
+            chunks = rag.index_text(
+                extracted.text,
+                source=f"upload://{safe_name}",
+                kind="upload",
+                extra_metadata={
+                    "doc_id": doc_id,
+                    "filename": safe_name,
+                    "content_type": file.content_type or "",
+                },
+            )
+        except Exception as e:
+            note = f"Texto extraido mas indexacao falhou: {e}"
+
+    return {
+        "id": doc_id,
+        "filename": file.filename,
+        "saved_as": str(saved_path.name),
+        "kind": extracted.kind,
+        "content_type": file.content_type,
+        "size": size,
+        "chunks": chunks,
+        "note": note,
+    }
+
+
+@app.get("/documents")
+async def list_documents():
+    """Lista as fontes ja indexadas no RAG (debug)."""
+    from rag import get_rag
+
+    try:
+        rag = get_rag()
+        return {"count": rag.count(), "sources": rag.sources()}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"Erro lendo RAG: {e}")
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=config.port,
+        reload=config.reload,
+    )

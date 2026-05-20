@@ -14,7 +14,7 @@ Rules:
 """
 
 
-def build_mathy(tools, model_name: str = "qwen2.5:7b"):
+def build_mathy(tools, model_name: str = "qwen3:14b"):
     model = ChatOllama(model=model_name, temperature=0, num_ctx=8192, callbacks=[LLMLogger("mathy")])
     my_tools = [t for t in tools if t.name == "calc"]
     return create_react_agent(model, tools=my_tools, prompt=PROMPT)
