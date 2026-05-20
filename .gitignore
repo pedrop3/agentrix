@@ -16,6 +16,11 @@ __pycache__/
 # Dados gerados em runtime
 mcp_server/notes/
 memory.db
-
 memory.db-shm
 memory.db-wal
+chroma_db/
+uploads/
+
+# Volumes do Docker (Neo4j) — gerenciados pelo docker-compose
+neo4j_data/
+neo4j_logs/
