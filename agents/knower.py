@@ -21,7 +21,8 @@ from logger import LLMLogger
 def _build_prompt() -> str:
     """Gera o prompt do knower a partir de config.web (lido do .env)."""
     web = config.web
-    return f"""You are a knowledge agent answering questions about
+    return f"""/no_think
+You are a knowledge agent answering questions about
 {web.display_name} using public content from {web.domain}.
 
 Context: {web.description}

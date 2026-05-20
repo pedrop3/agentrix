@@ -2,9 +2,11 @@
 from langchain_ollama import ChatOllama
 from langgraph.prebuilt import create_react_agent
 
+from config import config
 from logger import LLMLogger
 
-PROMPT = """You are a research agent. Your ONLY job is to search the user's saved notes
+PROMPT = """/no_think
+You are a research agent. Your ONLY job is to search the user's saved notes
 to find information they're asking about.
 
 Rules:
@@ -14,7 +16,13 @@ Rules:
 """
 
 
-def build_researcher(tools, model_name: str = "qwen3:14b"):
-    model = ChatOllama(model=model_name, temperature=0, num_ctx=8192, callbacks=[LLMLogger("researcher")])
+def build_researcher(tools, model_name: str = None):
+    name = model_name or config.ollama.researcher_model
+    model = ChatOllama(
+        model=name,
+        temperature=config.ollama.temperature,
+        num_ctx=config.ollama.num_ctx,
+        callbacks=[LLMLogger("researcher")],
+    )
     my_tools = [t for t in tools if t.name == "search_notes"]
     return create_react_agent(model, tools=my_tools, prompt=PROMPT)

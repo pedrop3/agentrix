@@ -42,6 +42,7 @@ def _extraction_prompt() -> str:
     """Prompt da extracao com display_name/dominio/idioma vindos do config."""
     web = config.web
     return (
+        "/no_think\n"
         "You extract a small product knowledge graph from text about "
         f"{web.display_name} (source: {web.domain}).\n\n"
         "Allowed node types (use ONLY these):\n"

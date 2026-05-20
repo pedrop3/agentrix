@@ -33,7 +33,8 @@ class RouterDecision(BaseModel):
 def _supervisor_prompt() -> str:
     """Prompt do supervisor com dominio/nome de exibicao vindos do config."""
     web = config.web
-    return f"""You are a supervisor routing user requests to specialized agents.
+    return f"""/no_think
+You are a supervisor routing user requests to specialized agents.
 
 Available agents:
 - "researcher": searches the user's own saved notes (writer-created)
@@ -63,22 +64,40 @@ You MUST return valid JSON with fields {{"next": "...", "reason": "..."}}.
 # mantido por compat — modulos que importam SUPERVISOR_PROMPT continuam funcionando
 SUPERVISOR_PROMPT = _supervisor_prompt()
 
-DIRECT_PROMPT = """You are a helpful assistant. Answer the user's question directly and concisely
-using the conversation history as context. Do not use any tools."""
+DIRECT_PROMPT = """/no_think
+You are a helpful assistant. Answer the user's question directly and concisely
+using the conversation history as context. Do not use any tools.
+Reply in 1-3 short sentences unless asked for more."""
 
 
 # ---------------------------------------------------------------------------
 # Builders
 # ---------------------------------------------------------------------------
-def build_supervisor(model_name: str = "qwen3:14b"):
-    """Returns a model that produces a RouterDecision via structured output."""
-    model = ChatOllama(model=model_name, temperature=0, num_ctx=8192, callbacks=[LLMLogger("supervisor")])
+def build_supervisor(model_name: str = None):
+    """Returns a model that produces a RouterDecision via structured output.
+
+    `/no_think` no prompt do supervisor desabilita o modo de raciocinio do
+    qwen3 — pra um routing de 6 opcoes, raciocinio interno e desperdicio.
+    """
+    name = model_name or config.ollama.supervisor_model
+    model = ChatOllama(
+        model=name,
+        temperature=config.ollama.temperature,
+        num_ctx=config.ollama.num_ctx,
+        callbacks=[LLMLogger("supervisor")],
+    )
     return model.with_structured_output(RouterDecision)
 
 
-def build_direct(model_name: str = "qwen3:14b"):
+def build_direct(model_name: str = None):
     """Returns a plain LLM for direct conversational answers."""
-    return ChatOllama(model=model_name, temperature=0, num_ctx=8192, callbacks=[LLMLogger("direct")])
+    name = model_name or config.ollama.direct_model
+    return ChatOllama(
+        model=name,
+        temperature=config.ollama.temperature,
+        num_ctx=config.ollama.num_ctx,
+        callbacks=[LLMLogger("direct")],
+    )
 
 
 class SupervisorState(MessagesState):
