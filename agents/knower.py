@@ -11,7 +11,7 @@ Estrategia:
   2. Se vazio, `web_search` (DDG site:<dominio>).
   3. Escolhe URL, `web_fetch(url)` -> indexa no RAG.
 """
-from langchain_ollama import ChatOllama
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.prebuilt import create_react_agent
 
 from config import config
@@ -92,12 +92,18 @@ KNOWER_TOOLS = {
 
 
 def build_knower(tools, model_name: str = None):
-    name = model_name or config.ollama.knower_model
-    model = ChatOllama(
-        model=name,
-        temperature=config.ollama.temperature,
-        num_ctx=config.ollama.num_ctx,
+    # usa Gemini SEMPRE
+    model = ChatGoogleGenerativeAI(
+        model=config.gemini.model,
+        google_api_key=config.gemini.api_key,
+        temperature=config.gemini.temperature,
         callbacks=[LLMLogger("knower")],
     )
+
     my_tools = [t for t in tools if t.name in KNOWER_TOOLS]
-    return create_react_agent(model, tools=my_tools, prompt=_build_prompt())
+
+    return create_react_agent(
+        model,
+        tools=my_tools,
+        prompt=_build_prompt()
+    )

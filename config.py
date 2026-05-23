@@ -160,22 +160,45 @@ class WebContextConfig:
         )
     )
 
+@dataclass(frozen=True)
+class GeminiConfig:
+    model: str = field(
+        default_factory=lambda: _env("GEMINI_MODEL", "gemini-2.5-flash")
+    )
+
+    api_key: str = field(
+        default_factory=lambda: _env("GEMINI_API_KEY", "")
+    )
+
+    temperature: float = field(
+        default_factory=lambda: float(_env("GEMINI_TEMPERATURE", "0"))
+    )
 
 @dataclass(frozen=True)
 class AppConfig:
+    # LLM providers
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
+    gemini: GeminiConfig = field(default_factory=GeminiConfig)
+
+    # Infra
     neo4j: Neo4jConfig = field(default_factory=Neo4jConfig)
     web: WebContextConfig = field(default_factory=WebContextConfig)
 
+    # App paths
     project_root: Path = PROJECT_ROOT
     memory_db: str = field(
         default_factory=lambda: str(PROJECT_ROOT / "memory.db")
     )
+
+    # LangGraph / runtime
     recursion_limit: int = field(
         default_factory=lambda: int(_env("AGENTRIX_RECURSION_LIMIT", "10"))
     )
 
-    port: int = field(default_factory=lambda: int(_env("PORT", "8000")))
+    port: int = field(
+        default_factory=lambda: int(_env("PORT", "8000"))
+    )
+
     reload: bool = field(
         default_factory=lambda: _env("AGENTRIX_RELOAD", "").lower() in {"1", "true", "yes"}
     )
