@@ -2,8 +2,27 @@ langgraph>=0.2.50
 langchain>=0.3.0
 langchain-core>=0.3.0
 langchain-ollama>=0.2.0
+langchain-google-genai
 langchain-mcp-adapters>=0.2.2
 mcp>=1.0.0
 pydantic>=2.0
 python-dotenv>=1.0.0
 langgraph-checkpoint-sqlite>=3.0.0
+
+# Servidor HTTP (FastAPI + SSE) para o chat UI
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+
+# RAG + knowledge graph (Neo4j 5+ com vector index nativo)
+neo4j>=5.20.0
+langchain-neo4j>=0.1.1
+
+# Scraping / fetch externo
+httpx>=0.27.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# Extração de texto de arquivos enviados pelo usuário
+pypdf>=4.0.0
+python-docx>=1.1.0
