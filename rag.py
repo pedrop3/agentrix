@@ -20,9 +20,61 @@ from typing import Iterable, Optional
 from config import config
 
 VECTOR_INDEX = config.neo4j.vector_index
+FULLTEXT_INDEX = "chunk_text_fulltext"
+
+# Caracteres reservados do Lucene que precisam ser escapados em queries livres.
+# (https://lucene.apache.org/core/9_0_0/queryparser/org/apache/lucene/queryparser/classic/package-summary.html)
+_LUCENE_SPECIALS = r'+-&|!(){}[]^"~*?:\/'
+
+# Pesos default da fusao RRF; constante mantida pra debug
+RRF_K = 60
 
 _singleton_lock = threading.Lock()
 _singleton: Optional["RAG"] = None
+
+
+def _escape_lucene(query: str) -> str:
+    """Escapa chars reservados do Lucene pra busca livre, sem quebrar a query.
+
+    Tambem remove caracteres de operadores que ficariam isolados.
+    """
+    out = []
+    for ch in query:
+        if ch in _LUCENE_SPECIALS:
+            out.append("\\")
+        out.append(ch)
+    cleaned = "".join(out).strip()
+    return cleaned or "*"  # fallback inocuo se vier vazio
+
+
+def _rrf_fuse(
+    vector_ranked: list[tuple[str, float]],
+    fulltext_ranked: list[tuple[str, float]],
+    rrf_k: int = RRF_K,
+) -> dict[str, dict]:
+    """Reciprocal Rank Fusion: combina dois rankings em um score unico.
+
+    Score de cada id = sum(1/(rrf_k + rank_i)) em todos os rankings onde aparece.
+    Retorna dict {chunk_id -> {rrf, vector_score, fulltext_score, vector_rank, fulltext_rank}}.
+    """
+    out: dict[str, dict] = {}
+    for rank, (cid, score) in enumerate(vector_ranked, start=1):
+        out.setdefault(cid, {
+            "rrf": 0.0, "vector_score": None, "fulltext_score": None,
+            "vector_rank": None, "fulltext_rank": None,
+        })
+        out[cid]["rrf"] += 1.0 / (rrf_k + rank)
+        out[cid]["vector_score"] = score
+        out[cid]["vector_rank"] = rank
+    for rank, (cid, score) in enumerate(fulltext_ranked, start=1):
+        out.setdefault(cid, {
+            "rrf": 0.0, "vector_score": None, "fulltext_score": None,
+            "vector_rank": None, "fulltext_rank": None,
+        })
+        out[cid]["rrf"] += 1.0 / (rrf_k + rank)
+        out[cid]["fulltext_score"] = score
+        out[cid]["fulltext_rank"] = rank
+    return out
 
 
 @dataclass
@@ -136,6 +188,28 @@ class RAG:
                 }}
                 """
             )
+            # Fulltext (Lucene) index sobre o texto do chunk — usado pelo
+            # hybrid_search pra combinar com a similaridade semantica.
+            # Analyzer 'portuguese' faz stemming PT, normaliza acentos e
+            # aplica IDF — resolve plurais e dá peso por raridade.
+            try:
+                s.run(
+                    f"""
+                    CREATE FULLTEXT INDEX {FULLTEXT_INDEX} IF NOT EXISTS
+                    FOR (c:Chunk) ON EACH [c.text]
+                    OPTIONS {{ indexConfig: {{ `fulltext.analyzer`: 'portuguese' }} }}
+                    """
+                )
+            except Exception as e:
+                # Fallback: alguma versao antiga do Neo4j pode nao aceitar
+                # analyzer custom. Cria com default (ainda funciona, so sem stemming PT).
+                print(f"[rag] portuguese analyzer falhou ({e}); usando default")
+                s.run(
+                    f"""
+                    CREATE FULLTEXT INDEX {FULLTEXT_INDEX} IF NOT EXISTS
+                    FOR (c:Chunk) ON EACH [c.text]
+                    """
+                )
 
     # -----------------------------------------------------------------------
     # Indexação
@@ -243,7 +317,144 @@ class RAG:
             ]
 
     # -----------------------------------------------------------------------
-    # Busca híbrida: vetor + expansão de grafo (1 hop)
+    # Hybrid search: vector + fulltext, fundidos via RRF
+    # -----------------------------------------------------------------------
+    def hybrid_search(
+        self,
+        query: str,
+        k: int = 5,
+        kind: Optional[str] = None,
+        exclude_kinds: Optional[Iterable[str]] = None,
+        min_vector_score: float = 0.0,
+        require_lexical: bool = True,
+    ) -> list[Hit]:
+        """Vector + fulltext fundidos com Reciprocal Rank Fusion.
+
+        Resolve dois problemas do vector puro:
+        - Falsos positivos em indice pequeno (vector achava chunks tematicamente
+          proximos mas semanticamente errados).
+        - Falsos negativos do lexical puro (plurais, sinonimos).
+
+        Estratégia:
+        1. Roda vector search (top 3*k) e fulltext search (top 3*k).
+        2. Funde ranks via RRF: `score = sum(1/(60+rank_i))` pra cada lista
+           onde o chunk aparece.
+        3. Filtro de qualidade (`require_lexical=True`): mantem so chunks que
+           OU apareceram no fulltext (= ao menos um termo significativo match)
+           OU tem score vetorial >= 0.80 (vector forte sozinho ja vale).
+        4. Devolve top-k ordenados por RRF.
+
+        Em cada Hit, `score` carrega o RRF combinado (normalizado pra 0..1
+        dividindo pelo max teorico). Hits ainda expoem o vector_score original
+        via metadata se precisar — aqui simplificamos pra Hit padrao.
+
+        - `min_vector_score`: piso pra vector hits entrarem na fusao.
+                              (0.0 = aceita tudo do vector)
+        - `kind`/`exclude_kinds`: filtros (mesma semantica do search() puro)
+        """
+        if not query.strip():
+            return []
+
+        excluded = list(exclude_kinds) if exclude_kinds else []
+        over_fetch = max(k * 3, 15)
+
+        # 1) Vector search
+        query_emb = self._embeddings.embed_query(query)
+        with self._driver.session(database=self._db) as s:
+            vec_res = list(
+                s.run(
+                    f"""
+                    CALL db.index.vector.queryNodes('{VECTOR_INDEX}', $k2, $emb)
+                    YIELD node AS c, score
+                    WHERE ($kind IS NULL OR c.kind = $kind)
+                      AND (size($excluded) = 0 OR NOT c.kind IN $excluded)
+                      AND score >= $min_score
+                    RETURN c.id AS id, c.text AS text, c.source AS source,
+                           c.kind AS kind, score
+                    ORDER BY score DESC
+                    LIMIT $k2
+                    """,
+                    emb=query_emb,
+                    k2=over_fetch,
+                    kind=kind,
+                    excluded=excluded,
+                    min_score=float(min_vector_score),
+                )
+            )
+
+            # 2) Fulltext search (Lucene) com o mesmo filtro de kind
+            lucene_q = _escape_lucene(query)
+            ft_res = list(
+                s.run(
+                    f"""
+                    CALL db.index.fulltext.queryNodes('{FULLTEXT_INDEX}', $q, {{limit: $k2}})
+                    YIELD node AS c, score
+                    WHERE ($kind IS NULL OR c.kind = $kind)
+                      AND (size($excluded) = 0 OR NOT c.kind IN $excluded)
+                    RETURN c.id AS id, c.text AS text, c.source AS source,
+                           c.kind AS kind, score
+                    """,
+                    q=lucene_q,
+                    k2=over_fetch,
+                    kind=kind,
+                    excluded=excluded,
+                )
+            )
+
+        # 3) Indexa metadata dos rows pra reaproveitar text/source/kind
+        by_id: dict[str, dict] = {}
+        vector_ranked: list[tuple[str, float]] = []
+        for r in vec_res:
+            cid = r["id"]
+            by_id[cid] = {"text": r["text"], "source": r["source"], "kind": r["kind"]}
+            vector_ranked.append((cid, float(r["score"])))
+
+        fulltext_ranked: list[tuple[str, float]] = []
+        fulltext_ids: set[str] = set()
+        for r in ft_res:
+            cid = r["id"]
+            by_id.setdefault(cid, {"text": r["text"], "source": r["source"], "kind": r["kind"]})
+            fulltext_ranked.append((cid, float(r["score"])))
+            fulltext_ids.add(cid)
+
+        # 4) Fusao RRF
+        fused = _rrf_fuse(vector_ranked, fulltext_ranked)
+
+        # 5) Filtro de qualidade: chunk so e mantido se passa em uma das duas
+        #    condicoes (defesa contra false-positive do vector):
+        STRONG_VECTOR = 0.80
+        kept: list[tuple[str, dict]] = []
+        for cid, scores in fused.items():
+            if not require_lexical:
+                kept.append((cid, scores))
+                continue
+            ft_match = cid in fulltext_ids
+            vec_strong = (scores["vector_score"] or 0.0) >= STRONG_VECTOR
+            if ft_match or vec_strong:
+                kept.append((cid, scores))
+
+        # 6) Ordena por RRF desc e normaliza score pra 0..1
+        if not kept:
+            return []
+        max_rrf = max(s["rrf"] for _, s in kept) or 1.0
+        kept.sort(key=lambda x: -x[1]["rrf"])
+
+        hits: list[Hit] = []
+        for cid, scores in kept[:k]:
+            meta = by_id[cid]
+            normalized = scores["rrf"] / max_rrf
+            hits.append(
+                Hit(
+                    text=meta["text"],
+                    source=meta["source"],
+                    kind=meta["kind"],
+                    score=normalized,
+                )
+            )
+        return hits
+
+    # -----------------------------------------------------------------------
+    # Busca semantica + expansão de grafo (1 hop)
     # -----------------------------------------------------------------------
     def search_with_entities(self, query: str, k: int = 5) -> dict:
         if not query.strip():

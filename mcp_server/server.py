@@ -137,19 +137,23 @@ def web_search(query: str) -> str:
     RAG_FIRST_MIN_SCORE = 0.65
     RAG_FIRST_EXCLUDE = {"search_results"}
 
-    # 1) RAG-first com criterio rigoroso
+    # 1) RAG-first com criterio rigoroso (score + lexical overlap)
     try:
         rag = get_rag()
-        local = rag.search(
+        candidates = rag.search(
             query,
-            k=3,
+            k=6,
             min_score=RAG_FIRST_MIN_SCORE,
             exclude_kinds=RAG_FIRST_EXCLUDE,
         )
-        print(f"[web_search] RAG hits >= {RAG_FIRST_MIN_SCORE}: {len(local)}")
+        local = [h for h in candidates if _lexical_overlap_ok(query, h.text)]
+        print(
+            f"[web_search] RAG hits >= {RAG_FIRST_MIN_SCORE}: {len(candidates)} "
+            f"(apos lexical filter: {len(local)})"
+        )
         if local:
             lines = [f"# [Origem: RAG local] Resultados confidentes em {domain}:"]
-            for i, h in enumerate(local, 1):
+            for i, h in enumerate(local[:3], 1):
                 snippet = h.text[:250].replace("\n", " ")
                 lines.append(
                     f"{i}. {h.source}  (kind={h.kind}, score={h.score:.3f})\n   {snippet}..."
@@ -236,26 +240,79 @@ def web_fetch(url: str) -> str:
 # ---------------------------------------------------------------------------
 # Tool 6: busca semantica no RAG (uploads + paginas ja fetchadas)
 # ---------------------------------------------------------------------------
+# Stopwords PT/EN minimas — descartadas no lexical-overlap check
+_STOPWORDS_LEX = {
+    # PT
+    "o", "a", "os", "as", "um", "uma", "uns", "umas", "de", "do", "da", "dos", "das",
+    "em", "no", "na", "nos", "nas", "para", "pra", "por", "com", "sem", "sobre", "ate",
+    "é", "e", "ou", "que", "qual", "quais", "como", "onde", "quando", "porque", "porquê",
+    "mais", "menos", "muito", "muita", "muitos", "muitas", "ser", "estar", "ter", "tem",
+    "tem", "são", "seu", "sua", "seus", "suas", "meu", "minha", "voce", "vocês", "este",
+    "esta", "esse", "essa", "isto", "isso", "aquele", "aquela", "aqui", "ali", "lá",
+    # EN
+    "the", "a", "an", "of", "to", "in", "on", "at", "by", "for", "with", "from", "and",
+    "or", "but", "is", "are", "was", "were", "be", "been", "this", "that", "what",
+    "which", "how", "why", "when", "where", "who", "i", "you", "he", "she", "it", "we",
+    "they",
+}
+
+
+def _lexical_overlap_ok(query: str, text: str, min_overlap: int = 1) -> bool:
+    """Verifica se ao menos `min_overlap` termos significativos da query aparecem
+    no texto. Evita que o vector search retorne chunks "proximos no espaco
+    vetorial" mas semanticamente errados."""
+    import re
+
+    def tokens(s: str) -> set[str]:
+        ws = re.findall(r"\w+", s.lower())
+        return {w for w in ws if len(w) >= 4 and w not in _STOPWORDS_LEX}
+
+    q = tokens(query)
+    if not q:  # query so com stopwords/curtas — desliga o filtro
+        return True
+    t = tokens(text)
+    return len(q & t) >= min_overlap
+
+
 @mcp.tool()
 def rag_search(query: str, k: int = 5) -> str:
     """Semantic search over indexed content (uploads + fetched pages).
 
-    Returns top-k chunks ranked by cosine similarity, ONLY hits with
-    score >= 0.5 (filtra ruido). Use this BEFORE going to web — if
-    there's a confident hit, answer from it. If nothing relevant comes
-    back, fall back to `web_search`.
+    Returns top-k chunks ranked by cosine similarity, com DUAS guards:
+      - score >= 0.6 (filtro semantico)
+      - overlap lexical com a query (pelo menos 1 palavra significativa em
+        comum) — pra evitar falso-positivo do vector search em indice pequeno.
+
+    Use this BEFORE going to web — if there's a confident hit, answer
+    from it. If nothing relevant comes back, fall back to `web_search`.
     """
     from rag import get_rag
 
-    MIN_SCORE = 0.5  # filtra hits muito fracos pra nao envenenar o agent
+    MIN_SCORE = 0.6
     try:
         rag = get_rag()
-        hits = rag.search(query, k=k, min_score=MIN_SCORE)
+        raw_hits = rag.search(query, k=k * 2, min_score=MIN_SCORE)  # over-fetch
     except Exception as e:
         return f"Error querying RAG: {e}"
-    if not hits:
+
+    if not raw_hits:
         return f"No indexed content matches '{query}' (above min_score={MIN_SCORE})."
-    return "\n\n---\n\n".join(h.to_block() for h in hits)
+
+    # Filtro lexical: chunk precisa partilhar pelo menos 1 palavra-chave da query
+    filtered = [h for h in raw_hits if _lexical_overlap_ok(query, h.text)]
+    discarded = len(raw_hits) - len(filtered)
+
+    if not filtered:
+        return (
+            f"No indexed content matches '{query}' "
+            f"({len(raw_hits)} chunks tinham score>={MIN_SCORE} mas nenhum tinha "
+            f"overlap lexical — provavelmente sao chunks tematicamente distantes). "
+            f"Try `web_search` instead."
+        )
+
+    head = f"# {len(filtered)} hit(s) relevantes (descartei {discarded} sem overlap lexical):"
+    body = "\n\n---\n\n".join(h.to_block() for h in filtered[:k])
+    return f"{head}\n\n{body}"
 
 
 # ---------------------------------------------------------------------------
