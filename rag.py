@@ -6,12 +6,6 @@ RAG sobre Neo4j
 - Knowledge graph na mesma instância: nós :Chunk + :Source + entidades
   bancárias (:Product / :Fee / :Requirement / :Benefit / :Channel / :Customer)
 
-Mantém a mesma API publica do módulo antigo:
-    from rag import get_rag, Hit
-    rag = get_rag()
-    rag.index_text("conteudo...", source="...", kind="web")
-    hits = rag.search("query", k=5)
-
 Esquema Cypher (criado em get_rag().init_schema()):
     (:Source {url})-[:CONTAINS]->(:Chunk {id, text, kind, source, embedding})
     (:Chunk)-[:MENTIONS]->(:Entity)
@@ -19,21 +13,13 @@ Esquema Cypher (criado em get_rag().init_schema()):
 """
 from __future__ import annotations
 
-import os
 import threading
-import uuid
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional
 
-EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
-EMBED_DIM = int(os.getenv("OLLAMA_EMBED_DIM", "768"))  # nomic-embed-text = 768
+from config import config
 
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "agentrix-dev-pwd")
-NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
-
-VECTOR_INDEX = "chunk_embedding_index"
+VECTOR_INDEX = config.neo4j.vector_index
 
 _singleton_lock = threading.Lock()
 _singleton: Optional["RAG"] = None
@@ -68,14 +54,7 @@ def _chunk(text: str, size: int = 900, overlap: int = 150) -> list[str]:
 
 
 def _silence_neo4j_notifications() -> dict:
-    """Tenta desabilitar notifications informacionais do Neo4j no driver.
-
-    O nome do parametro/enum mudou entre versoes do driver:
-      - >= 5.16  : notifications_disabled_classifications + NotificationDisabledClassification
-      - 5.x  old : notifications_disabled_categories + NotificationDisabledCategory
-
-    Tambem suprime via logging/warnings como rede de seguranca.
-    """
+    """Tenta desabilitar notifications informacionais do Neo4j no driver."""
     import logging
     import warnings
 
@@ -84,7 +63,6 @@ def _silence_neo4j_notifications() -> dict:
     warnings.filterwarnings("ignore", module=r"neo4j(\..*)?")
 
     out: dict = {}
-    # Tentativa 1: API nova (5.16+, baseada em GQL classifications)
     try:
         from neo4j import (
             NotificationMinimumSeverity,
@@ -99,7 +77,6 @@ def _silence_neo4j_notifications() -> dict:
         return out
     except ImportError:
         pass
-    # Tentativa 2: API antiga (categories)
     try:
         from neo4j import (
             NotificationMinimumSeverity,
@@ -121,12 +98,12 @@ class RAG:
         from neo4j import GraphDatabase
         from langchain_ollama import OllamaEmbeddings
 
-        driver_kwargs: dict = {"auth": (NEO4J_USER, NEO4J_PASSWORD)}
+        driver_kwargs: dict = {"auth": (config.neo4j.user, config.neo4j.password)}
         driver_kwargs.update(_silence_neo4j_notifications())
 
-        self._driver = GraphDatabase.driver(NEO4J_URI, **driver_kwargs)
-        self._embeddings = OllamaEmbeddings(model=EMBED_MODEL)
-        self._db = NEO4J_DATABASE
+        self._driver = GraphDatabase.driver(config.neo4j.uri, **driver_kwargs)
+        self._embeddings = OllamaEmbeddings(model=config.ollama.embed_model)
+        self._db = config.neo4j.database
         self.init_schema()
 
     # -----------------------------------------------------------------------
@@ -134,7 +111,6 @@ class RAG:
     # -----------------------------------------------------------------------
     def init_schema(self) -> None:
         with self._driver.session(database=self._db) as s:
-            # Constraints
             s.run(
                 "CREATE CONSTRAINT chunk_id IF NOT EXISTS "
                 "FOR (c:Chunk) REQUIRE c.id IS UNIQUE"
@@ -143,21 +119,18 @@ class RAG:
                 "CREATE CONSTRAINT source_url IF NOT EXISTS "
                 "FOR (s:Source) REQUIRE s.url IS UNIQUE"
             )
-            # Constraints pras entidades de banking (chave = name normalizado)
             for label in ("Product", "Fee", "Requirement", "Benefit", "Channel", "Customer"):
                 s.run(
                     f"CREATE CONSTRAINT {label.lower()}_name IF NOT EXISTS "
                     f"FOR (n:{label}) REQUIRE n.name IS UNIQUE"
                 )
-
-            # Vector index nativo (Neo4j 5+). cosine é o padrão pra similaridade semântica
             s.run(
                 f"""
                 CREATE VECTOR INDEX {VECTOR_INDEX} IF NOT EXISTS
                 FOR (c:Chunk) ON c.embedding
                 OPTIONS {{
                   indexConfig: {{
-                    `vector.dimensions`: {EMBED_DIM},
+                    `vector.dimensions`: {config.ollama.embed_dim},
                     `vector.similarity_function`: 'cosine'
                   }}
                 }}
@@ -192,17 +165,17 @@ class RAG:
                     "text": chunks[i],
                     "embedding": embeddings[i],
                     "chunk_index": i,
+                    # Mete chaves do metadata como propriedades do nó (Neo4j nao
+                    # aceita Map aninhado direto; precisa "achatar")
                     "metadata": {k: v for k, v in meta.items() if k != "title"},
                 }
                 for i in range(len(chunks))
             ],
         }
-        # Cypher: cria/atualiza Source, depois faz upsert dos Chunks ligados a ele.
-        # `MERGE` na Chunk{id} garante reindex sem duplicar.
         with self._driver.session(database=self._db) as s:
             s.run(
                 """
-               MERGE (src:Source {url: $source})
+                MERGE (src:Source {url: $source})
                 ON CREATE SET src.title = $title, src.kind = $kind, src.indexed_at = datetime()
                 ON MATCH  SET src.title = $title, src.kind = $kind, src.updated_at = datetime()
                 WITH src
@@ -213,11 +186,7 @@ class RAG:
                     c.kind        = $kind,
                     c.source      = $source,
                     c.chunk_index = row.chunk_index
-                
-                // Em vez de SET c.metadata = row.metadata, usamos APOC ou fundimos as propriedades de forma plana
-                // Isso garante que se row.metadata contiver chaves primitivas, elas viram propriedades diretas do nó c
                 SET c += row.metadata
-                
                 MERGE (src)-[:CONTAINS]->(c)
                 """,
                 params,
@@ -225,21 +194,35 @@ class RAG:
         return len(chunks)
 
     # -----------------------------------------------------------------------
-    # Busca
+    # Busca vetorial
     # -----------------------------------------------------------------------
-    def search(self, query: str, k: int = 5, kind: Optional[str] = None) -> list[Hit]:
+    def search(
+        self,
+        query: str,
+        k: int = 5,
+        kind: Optional[str] = None,
+        min_score: float = 0.0,
+        exclude_kinds: Optional[Iterable[str]] = None,
+    ) -> list[Hit]:
+        """Top-K chunks por similaridade coseno, com filtros opcionais.
+
+        - `kind`           : retorna so chunks desse kind
+        - `min_score`      : descarta hits com score < min_score (cosine, 0..1)
+        - `exclude_kinds`  : descarta hits cujo kind esteja nesse set
+        """
         if not query.strip():
             return []
         query_emb = self._embeddings.embed_query(query)
-        # Pega top-K * 2 do vector index e filtra por kind no Cypher.
-        # (db.index.vector.queryNodes não aceita filtros direto.)
+        excluded = list(exclude_kinds) if exclude_kinds else []
         with self._driver.session(database=self._db) as s:
             res = s.run(
                 f"""
                 CALL db.index.vector.queryNodes('{VECTOR_INDEX}', $k2, $emb)
                 YIELD node, score
                 WITH node AS c, score
-                WHERE $kind IS NULL OR c.kind = $kind
+                WHERE ($kind IS NULL OR c.kind = $kind)
+                  AND (size($excluded) = 0 OR NOT c.kind IN $excluded)
+                  AND score >= $min_score
                 RETURN c.text AS text,
                        c.source AS source,
                        c.kind AS kind,
@@ -249,8 +232,10 @@ class RAG:
                 """,
                 emb=query_emb,
                 k=k,
-                k2=k * 4,
+                k2=k * 6,  # over-fetch porque pode descartar muito
                 kind=kind,
+                min_score=float(min_score),
+                excluded=excluded,
             )
             return [
                 Hit(text=r["text"], source=r["source"], kind=r["kind"], score=float(r["score"]))
@@ -258,15 +243,11 @@ class RAG:
             ]
 
     # -----------------------------------------------------------------------
-    # Busca híbrida: vetor + expansão de grafo
+    # Busca híbrida: vetor + expansão de grafo (1 hop)
     # -----------------------------------------------------------------------
     def search_with_entities(self, query: str, k: int = 5) -> dict:
-        """
-        Busca chunks por similaridade e devolve também as entidades mencionadas
-        e seus vizinhos imediatos. Permite o knower fazer 'GraphRAG light'.
-        """
         if not query.strip():
-            return {"hits": [], "entities": []}
+            return {"hits": []}
         query_emb = self._embeddings.embed_query(query)
         with self._driver.session(database=self._db) as s:
             res = s.run(
@@ -276,76 +257,14 @@ class RAG:
                 WITH c, score ORDER BY score DESC LIMIT $k
                 OPTIONAL MATCH (c)-[:MENTIONS]->(e)
                 OPTIONAL MATCH (e)-[r]->(neighbor)
-                RETURN c.text AS text,
-                       c.source AS source,
-                       c.kind AS kind,
-                       score,
-                       collect(DISTINCT {{
-                         name: e.name,
-                         labels: labels(e),
-                         neighbors: collect(DISTINCT {{
-                           rel: type(r),
-                           name: neighbor.name,
-                           labels: labels(neighbor)
-                         }})
-                       }}) AS entities
-                """,
-                emb=query_emb,
-                k=k,
-                k2=k * 4,
-            )
-            hits = []
-            for r in res:
-                hits.append(
-                    {
-                        "text": r["text"],
-                        "source": r["source"],
-                        "kind": r["kind"],
-                        "score": float(r["score"]),
-                        "entities": [e for e in r["entities"] if e["name"]],
-                    }
-                )
-            return {"hits": hits}
-
-    def search_with_entities2(self, query: str, k: int = 5) -> dict:
-        """
-        Busca chunks por similaridade e devolve também as entidades mencionadas
-        e seus vizinhos imediatos. Permite o knower fazer 'GraphRAG light'.
-        """
-        if not query.strip():
-            return {"hits": [], "entities": []}
-
-        query_emb = self._embeddings.embed_query(query)
-
-        with self._driver.session(database=self._db) as s:
-            res = s.run(
-                f"""
-                CALL db.index.vector.queryNodes('{VECTOR_INDEX}', $k2, $emb)
-                YIELD node AS c, score
-                WITH c, score ORDER BY score DESC LIMIT $k
-                
-                // 1. Encontra as entidades mencionadas
-                OPTIONAL MATCH (c)-[:MENTIONS]->(e)
-                
-                // 2. Encontra os vizinhos dessas entidades
-                OPTIONAL MATCH (e)-[r]->(neighbor)
-                
-                // 3. Primeiro agrupamos os vizinhos para cada entidade
-                WITH c, score, e, 
-                     collect(DISTINCT {{
-                         rel: type(r),
-                         name: neighbor.name,
-                         labels: labels(neighbor)
-                     }}) AS entity_neighbors
-                
-                // 4. Agora agrupamos as entidades para o chunk c
+                WITH c, score, e,
+                     collect(DISTINCT {{rel: type(r), name: neighbor.name, labels: labels(neighbor)}}) AS entity_neighbors
                 WITH c, score,
                      collect(DISTINCT {{
                          name: e.name,
                          labels: labels(e),
                          neighbors: [n IN entity_neighbors WHERE n.name IS NOT NULL]
                      }}) AS entities
-                     
                 RETURN c.text AS text,
                        c.source AS source,
                        c.kind AS kind,
@@ -356,23 +275,109 @@ class RAG:
                 k=k,
                 k2=k * 4,
             )
-
-            hits = []
-            for r in res:
-                # Filtramos entidades que possam ter vindo nulas devido ao OPTIONAL MATCH
-                clean_entities = [e for e in r["entities"] if e.get("name") is not None]
-
-                hits.append(
+            return {
+                "hits": [
                     {
                         "text": r["text"],
                         "source": r["source"],
                         "kind": r["kind"],
                         "score": float(r["score"]),
-                        "entities": clean_entities,
+                        "entities": [e for e in r["entities"] if e.get("name")],
                     }
-                )
-            return {"hits": hits}
+                    for r in res
+                ]
+            }
 
+    # -----------------------------------------------------------------------
+    # Stats / inspeção
+    # -----------------------------------------------------------------------
+    def count(self) -> int:
+        with self._driver.session(database=self._db) as s:
+            r = s.run("MATCH (c:Chunk) RETURN count(c) AS n").single()
+            return int(r["n"]) if r else 0
+
+    def stats(self) -> dict:
+        """Conta chunks por kind + lista fontes (debug)."""
+        with self._driver.session(database=self._db) as s:
+            by_kind = {
+                r["kind"]: r["n"]
+                for r in s.run(
+                    "MATCH (c:Chunk) RETURN c.kind AS kind, count(c) AS n ORDER BY n DESC"
+                )
+            }
+            total = sum(by_kind.values())
+            sources_n = s.run("MATCH (s:Source) RETURN count(s) AS n").single()["n"]
+            entities_n = s.run(
+                "MATCH (e) WHERE any(l IN labels(e) WHERE l IN $allowed) RETURN count(e) AS n",
+                allowed=["Product", "Fee", "Requirement", "Benefit", "Channel", "Customer"],
+            ).single()["n"]
+            mentions_n = s.run(
+                "MATCH ()-[m:MENTIONS]->() RETURN count(m) AS n"
+            ).single()["n"]
+        return {
+            "chunks_total": total,
+            "chunks_by_kind": by_kind,
+            "sources": sources_n,
+            "entities": entities_n,
+            "mentions": mentions_n,
+        }
+
+    def sources(self) -> list[str]:
+        with self._driver.session(database=self._db) as s:
+            return [r["url"] for r in s.run("MATCH (s:Source) RETURN s.url AS url ORDER BY s.url")]
+
+    def chunks_for_source(self, source: str) -> list[dict]:
+        with self._driver.session(database=self._db) as s:
+            return [
+                {"id": r["id"], "text": r["text"]}
+                for r in s.run(
+                    """
+                    MATCH (s:Source {url: $url})-[:CONTAINS]->(c:Chunk)
+                    RETURN c.id AS id, c.text AS text ORDER BY c.chunk_index
+                    """,
+                    url=source,
+                )
+            ]
+
+    def delete_source(self, source: str) -> int:
+        """Remove uma fonte e todos os seus chunks. Útil pra limpar lixo de testes."""
+        with self._driver.session(database=self._db) as s:
+            r = s.run(
+                """
+                MATCH (src:Source {url: $url})-[:CONTAINS]->(c:Chunk)
+                WITH src, collect(c) AS chunks
+                FOREACH (c IN chunks | DETACH DELETE c)
+                DETACH DELETE src
+                RETURN size(chunks) AS removed
+                """,
+                url=source,
+            ).single()
+            return int(r["removed"]) if r else 0
+
+    def delete_by_kind(self, kind: str) -> int:
+        """Remove TODOS os chunks de um kind (ex: 'search_results'). Cuidado."""
+        with self._driver.session(database=self._db) as s:
+            r = s.run(
+                """
+                MATCH (c:Chunk {kind: $kind})
+                WITH count(c) AS n
+                MATCH (c:Chunk {kind: $kind}) DETACH DELETE c
+                RETURN n AS removed
+                """,
+                kind=kind,
+            ).single()
+            return int(r["removed"]) if r else 0
+
+    # -----------------------------------------------------------------------
+    # Acessores (RESTAURADOS — kg_extract e tools de grafo dependem disto)
+    # -----------------------------------------------------------------------
+    @property
+    def driver(self):
+        return self._driver
+
+    @property
+    def database(self) -> str:
+        return self._db
 
 
 def get_rag() -> RAG:

@@ -12,7 +12,7 @@ Stack: LangGraph + LangChain + Ollama + MCP.
 1. Instale o Ollama e baixe o modelo:
 
    ```
-   ollama pull qwen3:14b
+   ollama pull qwen3:8b
    ```
 
 2. Crie um virtualenv e instale as dependências:

@@ -46,7 +46,7 @@ def _model_or_default(key: str, default_model: str) -> str:
 
 
 # Modelo "base" — usado como fallback pros papeis especificos
-_DEFAULT_MODEL = _env("OLLAMA_MODEL", "qwen3:14b")
+_DEFAULT_MODEL = _env("OLLAMA_MODEL", "qwen3:8b")
 
 
 @dataclass(frozen=True)

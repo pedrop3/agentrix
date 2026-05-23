@@ -9,13 +9,36 @@ ou rotear pra outro agent.
 """
 from typing import Literal
 
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, MessagesState, StateGraph
 from pydantic import BaseModel, Field
 
 from config import config
 from logger import LLMLogger
+
+DIRECT_HISTORY_LIMIT = 6
+
+
+def _inject_no_think(messages: list) -> list:
+    """
+    Anexa ' /no_think' ao final da ULTIMA HumanMessage da lista (qwen3 so
+    respeita o switch quando ele esta na mensagem mais recente). Nao mexe
+    nas outras mensagens. Funciona pra qualquer modelo (pra modelos que
+    nao sao qwen3 vira so um sufixo inocuo).
+    """
+    if not messages:
+        return messages
+    out = list(messages)
+    for i in range(len(out) - 1, -1, -1):
+        m = out[i]
+        if isinstance(m, HumanMessage):
+            content = m.content if isinstance(m.content, str) else str(m.content)
+            if "/no_think" in content:
+                break  # ja tem
+            out[i] = HumanMessage(content=f"{content} /no_think", name=getattr(m, "name", None))
+            break
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -74,16 +97,13 @@ Reply in 1-3 short sentences unless asked for more."""
 # Builders
 # ---------------------------------------------------------------------------
 def build_supervisor(model_name: str = None):
-    """Returns a model that produces a RouterDecision via structured output.
-
-    `/no_think` no prompt do supervisor desabilita o modo de raciocinio do
-    qwen3 — pra um routing de 6 opcoes, raciocinio interno e desperdicio.
-    """
+    """Returns a model that produces a RouterDecision via structured output."""
     name = model_name or config.ollama.supervisor_model
     model = ChatOllama(
         model=name,
         temperature=config.ollama.temperature,
         num_ctx=config.ollama.num_ctx,
+        keep_alive="24h",  # mantem modelo carregado entre requests
         callbacks=[LLMLogger("supervisor")],
     )
     return model.with_structured_output(RouterDecision)
@@ -96,6 +116,7 @@ def build_direct(model_name: str = None):
         model=name,
         temperature=config.ollama.temperature,
         num_ctx=config.ollama.num_ctx,
+        keep_alive="24h",
         callbacks=[LLMLogger("direct")],
     )
 
@@ -112,15 +133,19 @@ def build_graph(researcher, writer, mathy, supervisor, direct, knower, checkpoin
         if getattr(last, "name", None) in ("researcher", "writer", "mathy", "knower", "direct"):
             print("[supervisor] -> END  (agent already responded)")
             return {"next": "END"}
-        messages = [SystemMessage(content=SUPERVISOR_PROMPT), *state["messages"]]
+        # Pra rotear, o supervisor so precisa da MENSAGEM ATUAL do usuario.
+        # Mandar todo o historico aqui = prompt enorme e routing igualmente correto.
+        # Encolhe drasticamente o prompt do supervisor em conversas longas.
+        messages = _inject_no_think([SystemMessage(content=SUPERVISOR_PROMPT), last])
         decision: RouterDecision = supervisor.invoke(messages)
         print(f"[supervisor] -> {decision.next}  ({decision.reason})")
         return {"next": decision.next}
 
     async def direct_node(state: SupervisorState):
-        # async + ainvoke garante que os tokens sao emitidos via astream/astream_events
-        # (necessario para o /chat/stream do server.py).
-        messages = [SystemMessage(content=DIRECT_PROMPT), *state["messages"]]
+        # Limita historico aos ultimos N mensagens (preserva contexto curto, evita
+        # arrastar respostas longas anteriores que inflam o prompt).
+        history = state["messages"][-DIRECT_HISTORY_LIMIT:]
+        messages = _inject_no_think([SystemMessage(content=DIRECT_PROMPT), *history])
         response = await direct.ainvoke(messages)
         return {"messages": [AIMessage(content=response.content, name="direct")]}
 

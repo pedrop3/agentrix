@@ -15,9 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# ---------------------------------------------------------------------------
-# Correção do Ambiente: Garante o carregamento do .env dentro do MCP
-# ---------------------------------------------------------------------------
+
 from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -122,36 +120,56 @@ def web_search(query: str) -> str:
       2. Otherwise, fall back to DuckDuckGo restricted to `site:<WEB_DOMAIN>`.
          Snippet summary is auto-indexed in the RAG for future hits.
 
-    The domain is set by `WEB_DOMAIN` in `.env` (default: bank.pt).
+    The domain is set by `WEB_DOMAIN` in `.env`.
     Returns a numbered list of {title, url, snippet}.
+
+    Strategy (BUG FIX):
+      1. RAG-first SO com hits FORTES (score >= 0.65) de paginas REAIS (kind='web').
+         Snippets de busca antigos (kind='search_results') sao ignorados aqui
+         porque enganavam o agent.
+      2. Senao, vai pra DDG.
     """
     from config import config
     from rag import get_rag
     from web_fetcher import search_site
 
     domain = config.web.domain
+    RAG_FIRST_MIN_SCORE = 0.65
+    RAG_FIRST_EXCLUDE = {"search_results"}
 
-    # 1) RAG-first
+    # 1) RAG-first com criterio rigoroso
     try:
         rag = get_rag()
-        local = rag.search(query, k=3)
+        local = rag.search(
+            query,
+            k=3,
+            min_score=RAG_FIRST_MIN_SCORE,
+            exclude_kinds=RAG_FIRST_EXCLUDE,
+        )
+        print(f"[web_search] RAG hits >= {RAG_FIRST_MIN_SCORE}: {len(local)}")
         if local:
-            lines = [f"# [Origem: RAG local] Resultados na base de conhecimento sobre {domain}:"]
+            lines = [f"# [Origem: RAG local] Resultados confidentes em {domain}:"]
             for i, h in enumerate(local, 1):
-                snippet = h.text[:200].replace("\n", " ")
-                lines.append(f"{i}. {h.source}\n   {snippet}...")
+                snippet = h.text[:250].replace("\n", " ")
+                lines.append(
+                    f"{i}. {h.source}  (kind={h.kind}, score={h.score:.3f})\n   {snippet}..."
+                )
             return "\n\n".join(lines)
     except Exception as e:
-        print(f"[web_search] RAG fallback: {e}")
+        print(f"[web_search] RAG check failed, going web: {e}")
 
     # 2) Web fallback (DDG + indexa snippets pro RAG)
+    print(f"[web_search] going to DDG for: {query!r}")
     try:
         results = search_site(query, max_results=6)
     except Exception as e:
         return f"Error searching {domain}: {e}"
 
     if not results:
-        return f"No results found on {domain} for '{query}'."
+        return (
+            f"No results found on {domain} for '{query}'. "
+            f"If you know a relevant URL on {domain}, call `web_fetch(url)` directly."
+        )
 
     try:
         rag = get_rag()
@@ -220,21 +238,23 @@ def web_fetch(url: str) -> str:
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def rag_search(query: str, k: int = 5) -> str:
-    """Semantic search over indexed content (user uploads + bank pages).
+    """Semantic search over indexed content (uploads + fetched pages).
 
-    Returns the top-k chunks ranked by similarity. Use this BEFORE going to
-    the web — if there's a confident hit, answer from it. If nothing
-    relevant comes back, fall back to `web_search`.
+    Returns top-k chunks ranked by cosine similarity, ONLY hits with
+    score >= 0.5 (filtra ruido). Use this BEFORE going to web — if
+    there's a confident hit, answer from it. If nothing relevant comes
+    back, fall back to `web_search`.
     """
     from rag import get_rag
 
+    MIN_SCORE = 0.5  # filtra hits muito fracos pra nao envenenar o agent
     try:
         rag = get_rag()
-        hits = rag.search(query, k=k)
+        hits = rag.search(query, k=k, min_score=MIN_SCORE)
     except Exception as e:
         return f"Error querying RAG: {e}"
     if not hits:
-        return f"No indexed content matches '{query}'."
+        return f"No indexed content matches '{query}' (above min_score={MIN_SCORE})."
     return "\n\n---\n\n".join(h.to_block() for h in hits)
 
 
@@ -256,6 +276,30 @@ def rag_sources() -> str:
         return "RAG is empty."
     listing = "\n".join(f"- {s}" for s in sources)
     return f"{total} chunks total across {len(sources)} sources:\n{listing}"
+
+
+@mcp.tool()
+def rag_stats() -> str:
+    """Diagnostic: counts of chunks (by kind), sources, entities and mentions.
+
+    Use this when the agent's behavior looks weird — it shows what is
+    actually indexed and whether the knowledge graph has been populated.
+    """
+    from rag import get_rag
+
+    try:
+        rag = get_rag()
+        s = rag.stats()
+    except Exception as e:
+        return f"Error reading RAG stats: {e}"
+    by_kind = "\n".join(f"    {k}: {v}" for k, v in s["chunks_by_kind"].items()) or "    (none)"
+    return (
+        f"chunks_total: {s['chunks_total']}\n"
+        f"chunks_by_kind:\n{by_kind}\n"
+        f"sources: {s['sources']}\n"
+        f"entities: {s['entities']}\n"
+        f"mentions: {s['mentions']}"
+    )
 
 
 # ---------------------------------------------------------------------------

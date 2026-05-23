@@ -21,7 +21,7 @@ from agents.researcher import build_researcher
 from agents.writer import build_writer
 from config import config
 from graph import build_direct, build_graph, build_supervisor
-from logger import reset_steps
+from logger import reset_steps, turn_summary
 
 # Estado global compartilhado entre requests
 runtime: dict = {}
@@ -138,12 +138,15 @@ async def health():
 async def chat(body: ChatBody):
     graph = _get_graph()
     reset_steps()
-    result = await graph.ainvoke(
-        {"messages": [_build_user_message(body)]},
-        config=_config_for(body),
-    )
-    last = result["messages"][-1]
-    return {"reply": last.content}
+    try:
+        result = await graph.ainvoke(
+            {"messages": [_build_user_message(body)]},
+            config=_config_for(body),
+        )
+        last = result["messages"][-1]
+        return {"reply": last.content}
+    finally:
+        print(turn_summary())
 
 
 @app.post("/chat/stream")
@@ -193,6 +196,8 @@ async def chat_stream(body: ChatBody, request: Request):
             err = json.dumps({"error": str(exc)}, ensure_ascii=False)
             yield f"data: {err}\n\n".encode("utf-8")
             yield b"data: [DONE]\n\n"
+        finally:
+            print(turn_summary())
 
     return StreamingResponse(
         event_source(),
@@ -294,6 +299,36 @@ async def list_documents():
         return {"count": rag.count(), "sources": rag.sources()}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"Erro lendo RAG: {e}")
+
+
+@app.get("/documents/stats")
+async def rag_stats():
+    """Diagnostico: contagem por kind, entidades, mentions. Use pra entender
+    o estado do RAG sem precisar passar por agent."""
+    from rag import get_rag
+
+    try:
+        rag = get_rag()
+        return rag.stats()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"Erro lendo stats: {e}")
+
+
+@app.delete("/documents/{kind}")
+async def delete_documents_by_kind(kind: str):
+    """Apaga TODOS os chunks de um kind. Use com cuidado.
+
+    Caso de uso: `DELETE /documents/search_results` pra limpar snippets
+    de DDG antigos que estavam confundindo o RAG-first.
+    """
+    from rag import get_rag
+
+    try:
+        rag = get_rag()
+        removed = rag.delete_by_kind(kind)
+        return {"kind": kind, "removed": removed}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"Erro removendo kind={kind}: {e}")
 
 
 if __name__ == "__main__":

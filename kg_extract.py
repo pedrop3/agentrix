@@ -15,7 +15,7 @@ E relações de domínio entre as próprias entidades, ex.:
     (:Product)-[:AVAILABLE_IN]->(:Channel)
     (:Product)-[:FOR_SEGMENT]->(:Customer)
 
-O LLM (qwen3:14b via Ollama) é forçado a devolver JSON estruturado.
+O LLM (qwen3:8b via Ollama) é forçado a devolver JSON estruturado.
 """
 from __future__ import annotations
 
