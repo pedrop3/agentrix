@@ -13,6 +13,7 @@ Estrategia:
 """
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.prebuilt import create_react_agent
+from langchain_ollama import ChatOllama
 
 from config import config
 from logger import LLMLogger
@@ -21,7 +22,7 @@ from logger import LLMLogger
 def _build_prompt() -> str:
     """Gera o prompt do knower a partir de config.web (lido do .env)."""
     web = config.web
-    return f"""/no_think
+    return f"""
 You are a knowledge agent answering questions about
 {web.display_name} using public content from {web.domain}.
 
@@ -33,8 +34,8 @@ You have these tools (all backed by Neo4j: vector index + knowledge graph):
   Vector / web tools:
   - `rag_search(query)`     : semantic search over indexed content
                               (user uploads + previously fetched {web.domain} pages)
-  - `web_search(query)`     : DuckDuckGo restricted to site:{web.domain}
-                              (RAG-first; falls back to web)
+  - `web_search(query)`     : DuckDuckGo restricted to site:{web.domain} and INDEX it
+                
   - `web_fetch(url)`        : download HTML/PDF from {web.domain} and INDEX it
 
   Graph tools (for comparing items, finding requirements/fees/benefits):
@@ -67,6 +68,21 @@ CRITICAL anti-loop rules:
     matches ...', that path is dead — IMMEDIATELY move to the next step.
   - After at most 4 tool calls, you MUST produce a final answer.
 
+CRITICAL anti-contamination (key identifier matching):
+  - Identify the KEY IDENTIFIER of the product/service the user is asking
+    about (e.g. "Select", "Jovem", "Teens", "Gold", "Black").
+  - A RAG chunk is relevant if it contains that key identifier, even if
+    the exact phrasing differs. Examples:
+      · User asks about "Conta Select" → chunk says "Ser cliente Select"
+        → RELEVANT ("Select" is the shared identifier).
+      · User asks about "Conta Select" → chunk says "Conta Jovem"
+        → IRRELEVANT ("Jovem" ≠ "Select").
+  - If none of the returned chunks contain the key identifier, treat the
+    rag_search result as a miss and proceed to web_search.
+  - NEVER use conversation history from prior turns to answer the current
+    question. You have no memory of previous searches. Each question must
+    be researched independently with tools.
+
 CRITICAL anti-hallucination:
   - If rag_search returned content about a DIFFERENT topic than the user
     asked, DO NOT cite it. Go to web_search.
@@ -75,8 +91,7 @@ CRITICAL anti-hallucination:
 
 Hard rules:
   - Only PUBLIC pages of {web.domain}. NEVER claim access to authenticated
-    areas (e.g. Netbanco, online banking, account details).
-  - Do not perform math. If math is needed, stop and say so.
+    areas.
   - Be conservative with `kg_extract` — it does LLM calls per chunk.
 """
 
@@ -92,13 +107,20 @@ KNOWER_TOOLS = {
 
 
 def build_knower(tools, model_name: str = None):
-    # usa Gemini SEMPRE
+
     model = ChatGoogleGenerativeAI(
         model=config.gemini.model,
         google_api_key=config.gemini.api_key,
         temperature=config.gemini.temperature,
         callbacks=[LLMLogger("knower")],
     )
+
+    # model = ChatOllama(
+    #     model=config.ollama.knower_model,
+    #     temperature=config.ollama.temperature,
+    #     num_ctx=config.ollama.num_ctx,
+    #     callbacks=[LLMLogger("knower")],
+    # )
 
     my_tools = [t for t in tools if t.name in KNOWER_TOOLS]
 

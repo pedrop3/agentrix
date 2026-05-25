@@ -45,9 +45,6 @@ async def lifespan(app: FastAPI):
     tools = await client.get_tools()
     print(f"[server] Tools carregadas do MCP: {[t.name for t in tools]}")
 
-    researcher = build_researcher(tools, config.ollama.researcher_model)
-    writer = build_writer(tools, config.ollama.writer_model)
-    mathy = build_mathy(tools, config.ollama.mathy_model)
     knower = build_knower(tools, config.ollama.knower_model)
     supervisor = build_supervisor(config.ollama.supervisor_model)
     direct = build_direct(config.ollama.direct_model)

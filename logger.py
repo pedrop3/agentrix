@@ -1,78 +1,73 @@
 from __future__ import annotations
 
+import json
 import re
 import textwrap
 import threading
 import time
 from collections import defaultdict
-from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import HumanMessage
 
-# ---------------------------------------------------------------------------
-# Estado global (turno + step counter)
-# ---------------------------------------------------------------------------
+W = 78  # line width
+
+# ─── Global turn state ────────────────────────────────────────────────────────
 _lock = threading.Lock()
-_step = 0
+_global_step = 0
 _turn_start_ts: float | None = None
 _turn_breakdown: dict[str, float] = defaultdict(float)
 _turn_calls: dict[str, int] = defaultdict(int)
+_loggers: list["LLMLogger"] = []
+
+
+def get_logger(agent_name: str) -> "LLMLogger | None":
+    """Return the registered LLMLogger for agent_name, or None."""
+    return next((l for l in _loggers if l.agent_name == agent_name), None)
 
 
 def reset_steps() -> None:
-    """Chame no inicio de cada TURN do usuario (uma pergunta = um turno)."""
-    global _step, _turn_start_ts
+    global _global_step, _turn_start_ts
     with _lock:
-        _step = 0
+        _global_step = 0
         _turn_start_ts = time.perf_counter()
         _turn_breakdown.clear()
         _turn_calls.clear()
+    for lgr in _loggers:
+        lgr._reset_turn()
 
 
-def _next_step() -> int:
-    global _step
+def _next_global_step() -> int:
+    global _global_step
     with _lock:
-        _step += 1
-        return _step
+        _global_step += 1
+        return _global_step
 
 
+# ─── Turn summary ─────────────────────────────────────────────────────────────
 def turn_summary() -> str:
-    """Imprime sumario do turno."""
     if _turn_start_ts is None:
         return ""
     elapsed = time.perf_counter() - _turn_start_ts
-    lines = [f"\n┏━ TURN SUMMARY ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"]
-    lines.append(f"┃  total wall:        {elapsed:>7.2f}s")
-    if _turn_breakdown:
-        lines.append("┃  por papel:")
-        for agent, t in sorted(_turn_breakdown.items(), key=lambda x: -x[1]):
-            calls = _turn_calls.get(agent, 0)
-            pct = (t / elapsed * 100) if elapsed > 0 else 0
-            lines.append(f"┃    {agent:<14} {t:>6.2f}s  ({calls} calls, {pct:>4.1f}%)")
-    lines.append(f"┗{'━' * 61}┛")
-    return "\n".join(lines)
+    agents = {k: v for k, v in _turn_breakdown.items() if not k.startswith("tool:")}
+    tools_total = sum(v for k, v in _turn_breakdown.items() if k.startswith("tool:"))
+    parts = []
+    for name, t in sorted(agents.items(), key=lambda x: -x[1]):
+        calls = _turn_calls.get(name, 0)
+        parts.append(f"{name} {t:.2f}s ({calls}x)")
+    if tools_total > 0:
+        parts.append(f"tools {tools_total:.2f}s")
+    bar = " │ ".join(parts)
+    sep = "─" * W
+    return f"\n{sep}\nTOTAL {elapsed:.2f}s │ {bar}\n{sep}"
 
 
-# ---------------------------------------------------------------------------
-# Formatacao (caixas / mensagens)
-# ---------------------------------------------------------------------------
-W = 76  # largura da caixa
-
-_ROLE_LABEL = {
-    "system": "SYSTEM",
-    "human": "USER",
-    "ai": "AI",
-    "tool": "TOOL",
-    "HumanMessage": "USER",
-    "AIMessage": "AI",
-    "SystemMessage": "SYSTEM",
-    "ToolMessage": "TOOL",
-}
-
-
-def _role(msg) -> str:
-    t = getattr(msg, "type", None) or type(msg).__name__
-    return _ROLE_LABEL.get(t, t.upper()[:6])
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+def _strip_think(text: str) -> tuple[str, str]:
+    think_parts = re.findall(r"<think>(.*?)</think>", text, re.DOTALL)
+    visible = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    think = "\n".join(p.strip() for p in think_parts if p.strip())
+    return think, visible
 
 
 def _content(msg) -> str:
@@ -82,204 +77,242 @@ def _content(msg) -> str:
     return str(c).strip()
 
 
-def _strip_think(text: str) -> tuple[str, str]:
-    """Separa <think>...</think> do resto. Retorna (think_content, visible)."""
-    think_parts = re.findall(r"<think>(.*?)</think>", text, re.DOTALL)
-    visible = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-    think = "\n".join(p.strip() for p in think_parts if p.strip())
-    return think, visible
+def _fmt_args(args: dict) -> str:
+    if not args:
+        return "()"
+    parts = []
+    for k, v in args.items():
+        vs = repr(v) if isinstance(v, str) else str(v)
+        if len(vs) > 55:
+            vs = vs[:52] + "…'"
+        parts.append(f"{k}={vs}")
+    s = ", ".join(parts)
+    if len(s) > W - 18:
+        s = s[:W - 21] + "…"
+    return s
 
 
-def _wrap(text: str, indent: int = 4, max_lines: int = 8) -> list[str]:
-    prefix = " " * indent
-    available = W - indent - 2
-    lines: list[str] = []
-    for raw in text.splitlines():
-        if not raw.strip():
-            continue
-        chunks = textwrap.wrap(raw, width=available) or [raw[:available]]
-        lines.extend(chunks)
-    if len(lines) > max_lines:
-        omitted = len(lines) - max_lines
-        lines = lines[: max_lines] + [f"… (+{omitted} linhas)"]
-    return [f"{prefix}{l}" for l in lines]
+def _fmt_tool_input(input_str: str) -> str:
+    """Parse tool args from JSON or Python-dict repr into key=val format."""
+    # 1) Try JSON  (standard format, e.g. Ollama)
+    try:
+        args = json.loads(input_str)
+        if isinstance(args, dict):
+            return _fmt_args(args)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # 2) Try Python literal  (Gemini serialises as {'key': 'val'})
+    try:
+        import ast
+        args = ast.literal_eval(input_str)
+        if isinstance(args, dict):
+            return _fmt_args(args)
+    except (ValueError, SyntaxError):
+        pass
+    return textwrap.shorten(str(input_str), width=W - 18, placeholder="…")
 
 
-def _header(step: int, agent: str, tag: str) -> str:
-    label = f" #{step} · {agent.upper()} · {tag} "
-    pad = W - len(label) - 2
-    return f"\n╔{label}{'═' * max(pad, 0)}╗"
+def _extract_text(raw) -> str:
+    """Extract plain text from any tool-output shape.
+
+    Handles:
+    - plain str
+    - LangChain ToolMessage / any object with .content
+    - list of content blocks: [{'type': 'text', 'text': '...'}, ...]
+      (Gemini and Anthropic both use this format for structured output)
+    - nested: .content is itself a list of blocks
+    """
+    # Unwrap .content if present (ToolMessage, AIMessage, etc.)
+    if hasattr(raw, "content"):
+        raw = raw.content
+
+    # List of content blocks → join the 'text' fields
+    if isinstance(raw, list):
+        parts: list[str] = []
+        for block in raw:
+            if isinstance(block, dict):
+                parts.append(block.get("text") or block.get("value") or str(block))
+            else:
+                parts.append(str(block))
+        return " ".join(p for p in parts if p)
+
+    return str(raw)
 
 
-def _footer() -> str:
-    return f"╚{'═' * W}╝"
+def _fmt_result(raw, max_len: int = 220) -> str:
+    """Collapse whitespace and truncate tool output for display."""
+    text = _extract_text(raw)
+    text = " ".join(text.split())   # normalise whitespace
+    if len(text) > max_len:
+        return text[:max_len - 1] + "…"
+    return text
 
 
-def _line(text: str = "") -> str:
-    return f"║  {text}"
+def _get_user_question(messages) -> str:
+    for msg_list in reversed(messages):
+        for msg in reversed(msg_list):
+            if isinstance(msg, HumanMessage) or getattr(msg, "type", "") == "human":
+                c = _content(msg)
+                c = re.sub(r"\s*/no_think\s*$", "", c).strip()
+                if c:
+                    return c
+    return ""
 
 
-def _sep() -> str:
-    return f"║  {'─' * (W - 4)}"
-
-
-def _msg_block(msg) -> list[str]:
-    role = _role(msg)
-    content = _content(msg)
-    if not content:
-        return [_line(f"[{role}]  (empty)")]
-    # primeira linha curta inline
-    first_try = f"[{role:<6}] {content}"
-    if len(first_try) <= W - 4 and "\n" not in content:
-        return [_line(first_try)]
-    out = [_line(f"[{role:<6}]")]
-    out.extend(_line(l) for l in _wrap(content, indent=4, max_lines=5))
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Callback principal
-# ---------------------------------------------------------------------------
+# ─── Callback ─────────────────────────────────────────────────────────────────
 class LLMLogger(BaseCallbackHandler):
     def __init__(self, agent_name: str = "llm"):
         self.agent_name = agent_name
-        # Estado por step ativo (LangChain pode aninhar; usamos lista pra empilhar)
-        self._step_stack: list[dict[str, Any]] = []
+        self._reset_turn()
+        _loggers.append(self)
 
-    # ----- LLM events -----
+    def _reset_turn(self):
+        self._first_call = True
+        self._t0_llm: float | None = None
+        self._tool_t0: dict[str, tuple[float, str]] = {}
+        self._agent_step = 0
+
+    # ── LLM events ────────────────────────────────────────────────────────────
+
     def on_chat_model_start(self, serialized, messages, **kwargs):
-        step = _next_step()
-        t0 = time.perf_counter()
-        self._step_stack.append({"step": step, "t0": t0, "n_msgs": 0})
+        self._t0_llm = time.perf_counter()
+        _next_global_step()
 
-        n_msgs = sum(len(ml) for ml in messages)
-        self._step_stack[-1]["n_msgs"] = n_msgs
+        if not self._first_call:
+            return
+        self._first_call = False
 
-        print(_header(step, self.agent_name, f"INPUT ({n_msgs} msg)"))
-        print(_sep())
-        for msg_list in messages:
-            for msg in msg_list:
-                for line in _msg_block(msg):
-                    print(line)
-        print(_line())
+        if self.agent_name == "supervisor":
+            question = _get_user_question(messages)
+            sep = "─" * W
+            print(f"\n{sep}")
+            if question:
+                print(f"TURN  {question}")
+            print(f"{sep}\n")
+        else:
+            pad = max(W - 4 - len(self.agent_name), 2)
+            print(f"\n── {self.agent_name} {'─' * pad}")
 
     def on_llm_end(self, response, **kwargs):
-        if not self._step_stack:
-            return
-        frame = self._step_stack.pop()
-        elapsed = time.perf_counter() - frame["t0"]
+        elapsed = time.perf_counter() - (self._t0_llm or time.perf_counter())
+        with _lock:
+            _turn_breakdown[self.agent_name] += elapsed
+            _turn_calls[self.agent_name] += 1
 
-        # Acumula no breakdown do turno
-        _turn_breakdown[self.agent_name] += elapsed
-        _turn_calls[self.agent_name] += 1
+        if self.agent_name == "supervisor":
+            return  # routing decision is printed by graph.py
 
-        print(_line("┌─ OUTPUT"))
-        print(_sep())
-
-        think_total = ""
-        visible_total = ""
-        tool_calls_all: list[dict] = []
+        tool_calls: list[dict] = []
+        visible_text = ""
 
         for gens in response.generations:
             for gen in gens:
                 msg = getattr(gen, "message", None)
+                tool_calls.extend(getattr(msg, "tool_calls", []) if msg else [])
                 text = (_content(msg) if msg else getattr(gen, "text", "")).strip()
-                tool_calls_all.extend(getattr(msg, "tool_calls", []) if msg else [])
-                think, visible = _strip_think(text)
-                if think:
-                    think_total += think + "\n"
+                _, visible = _strip_think(text)
                 if visible:
-                    visible_total += visible + "\n"
+                    visible_text += visible + "\n"
 
-        if visible_total.strip():
-            for line in _wrap(visible_total.strip(), indent=2, max_lines=10):
-                print(_line(line))
-        elif not tool_calls_all and not think_total:
-            print(_line("(empty)"))
+        visible_text = visible_text.strip()
 
-        for tc in tool_calls_all:
-            name = tc.get("name", "?")
-            args = tc.get("args", {})
-            args_str = str(args)
-            if len(args_str) > W - 30:
-                args_str = args_str[: W - 33] + "..."
-            print(_line(f"⤷ tool_call  {name}({args_str})"))
-
-        if think_total.strip():
-            think_lines = think_total.strip().splitlines()
-            think_chars = len(think_total)
-            print(_line())
-            print(_line(f"┌─ [THINK] {len(think_lines)} linhas, {think_chars} chars (gastou tokens)"))
-            # mostra so as primeiras 3 linhas pra dar uma ideia do que tava pensando
-            for line in _wrap(think_total.strip(), indent=2, max_lines=3):
-                print(_line(line))
-
-        # Tokens
-        prompt_tok = compl_tok = 0
-        for gens in response.generations:
-            for gen in gens:
-                msg = getattr(gen, "message", None)
-                um = getattr(msg, "usage_metadata", None)
-                if um:
-                    prompt_tok += um.get("input_tokens", 0)
-                    compl_tok += um.get("output_tokens", 0)
+        if tool_calls and visible_text:
+            # Agent narrated its reasoning before the tool call
+            short = textwrap.shorten(visible_text, width=W - 5, placeholder="…")
+            print(f"  ┄ {short}")
+        elif not tool_calls and visible_text:
+            # Final answer — no more tool calls
+            pad = max(W - 10, 2)
+            print(f"\n── ANSWER {'─' * pad}")
+            for raw_line in visible_text.splitlines():
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    print()
                     continue
-                gi = getattr(gen, "generation_info", None) or {}
-                prompt_tok += gi.get("prompt_eval_count", 0)
-                compl_tok += gi.get("eval_count", 0)
-        if prompt_tok == 0 and compl_tok == 0:
-            lo = getattr(response, "llm_output", None) or {}
-            tu = lo.get("token_usage") or {}
-            prompt_tok = tu.get("prompt_tokens", 0)
-            compl_tok = tu.get("completion_tokens", 0)
-        total = prompt_tok + compl_tok
-
-        gen_rate = (compl_tok / elapsed) if elapsed > 0 and compl_tok > 0 else 0
-        print(_line())
-        print(_line("┌─ STATS"))
-        print(_line(
-            f"  elapsed = {elapsed:>5.2f}s   "
-            f"tokens(in/out/total) = {prompt_tok}/{compl_tok}/{total}   "
-            f"gen = {gen_rate:.1f} tok/s"
-        ))
-        print(_footer())
+                for chunk in textwrap.wrap(raw_line, width=W - 3) or [raw_line]:
+                    print(f"   {chunk}")
+            print("─" * W)
+        # else: pure tool-call response — on_tool_start prints the step line
 
     def on_llm_error(self, error, **kwargs):
-        if self._step_stack:
-            frame = self._step_stack.pop()
-            elapsed = time.perf_counter() - frame["t0"]
-            print(_line())
-            print(_line(f"✗ ERROR after {elapsed:.2f}s: {error}"))
-            print(_footer())
-        else:
-            print(f"✗ LLM error (no step active): {error}")
+        elapsed = time.perf_counter() - (self._t0_llm or time.perf_counter())
+        with _lock:
+            _turn_breakdown[self.agent_name] += elapsed
+            _turn_calls[self.agent_name] += 1
+        print(f"\n  ✗ [{self.agent_name}] {elapsed:.2f}s  {error}")
 
-    # ----- Tool events (capturam tools chamadas via create_react_agent) -----
+    # ── Tool events ────────────────────────────────────────────────────────────
+
     def on_tool_start(self, serialized, input_str, **kwargs):
         name = serialized.get("name", "?") if isinstance(serialized, dict) else "?"
-        short = textwrap.shorten(str(input_str), width=W - 16, placeholder="…")
-        run_id = kwargs.get("run_id")
-        with _lock:
-            self._tool_t0 = getattr(self, "_tool_t0", {})
-            self._tool_t0[str(run_id)] = (time.perf_counter(), name)
-        print(f"\n  ► TOOL  {self.agent_name} → {name}({short})")
+        run_id = str(kwargs.get("run_id", ""))
+        self._agent_step += 1
+        step = self._agent_step
+        self._tool_t0[run_id] = (time.perf_counter(), name)
+        args = _fmt_tool_input(str(input_str))
+        print(f" {step:>2}  {name}  {args}")
 
     def on_tool_end(self, output, **kwargs):
         run_id = str(kwargs.get("run_id", ""))
-        t0_map = getattr(self, "_tool_t0", {})
-        info = t0_map.pop(run_id, None)
+        info = self._tool_t0.pop(run_id, None)
         elapsed = (time.perf_counter() - info[0]) if info else 0.0
         name = info[1] if info else "?"
-        short = textwrap.shorten(str(output), width=W - 16, placeholder="…")
-        # contabiliza no breakdown como "tool:<nome>"
-        if info:
+        with _lock:
             _turn_breakdown[f"tool:{name}"] += elapsed
             _turn_calls[f"tool:{name}"] += 1
-        print(f"  ◄ TOOL  {name}  done in {elapsed:.2f}s   → {short}")
+
+        result = _fmt_result(output)   # handles ToolMessage, str, content-block lists
+        timing = f"{elapsed:.2f}s"
+        available = W - 7 - len(timing)
+        if len(result) < available:
+            padding = " " * (available - len(result))
+        else:
+            result = result[:available - 1] + "…"
+            padding = " "
+        print(f"     ╰ {result}{padding}{timing}")
 
     def on_tool_error(self, error, **kwargs):
         run_id = str(kwargs.get("run_id", ""))
-        t0_map = getattr(self, "_tool_t0", {})
-        info = t0_map.pop(run_id, None)
+        info = self._tool_t0.pop(run_id, None)
         elapsed = (time.perf_counter() - info[0]) if info else 0.0
-        print(f"  ✗ TOOL  failed in {elapsed:.2f}s: {error}")
+        print(f"     ╰ ✗ {error}  ({elapsed:.2f}s)")
+
+
+# ─── ToolOnlyLogger ───────────────────────────────────────────────────────────
+class ToolOnlyLogger(BaseCallbackHandler):
+    """Thin proxy that forwards ONLY tool events to a parent LLMLogger.
+
+    Why this exists
+    ---------------
+    In LangGraph's create_react_agent the LLM node and the ToolNode are
+    separate graph nodes. Callbacks attached to the LLM object (static) fire
+    for LLM events but are NOT inherited by the ToolNode.  Passing this proxy
+    in the *invocation config* (config={"callbacks": [ToolOnlyLogger(...)]})
+    makes LangGraph propagate it to every child node — including ToolNode —
+    so on_tool_start / on_tool_end fire correctly.
+
+    All LLM-level handlers are intentional no-ops here to prevent the same
+    event from being logged twice (once from the static callback on the model,
+    once from this proxy in the invocation config).
+    """
+
+    def __init__(self, parent: LLMLogger) -> None:
+        super().__init__()
+        self._parent = parent
+
+    # ── delegate tool events ──────────────────────────────────────────────────
+
+    def on_tool_start(self, serialized, input_str, **kwargs):
+        self._parent.on_tool_start(serialized, input_str, **kwargs)
+
+    def on_tool_end(self, output, **kwargs):
+        self._parent.on_tool_end(output, **kwargs)
+
+    def on_tool_error(self, error, **kwargs):
+        self._parent.on_tool_error(error, **kwargs)
+
+    # ── explicit no-ops for LLM events (prevent double logging) ──────────────
+
+    def on_chat_model_start(self, *args, **kwargs): pass
+    def on_llm_end(self, *args, **kwargs): pass
+    def on_llm_error(self, *args, **kwargs): pass

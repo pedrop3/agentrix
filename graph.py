@@ -8,14 +8,14 @@ Cada sub-agent, depois de rodar, volta pro supervisor — que pode encerrar
 ou rotear pra outro agent.
 """
 from typing import Literal
-
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, MessagesState, StateGraph
 from pydantic import BaseModel, Field
 
 from config import config
-from logger import LLMLogger
+from logger import LLMLogger, ToolOnlyLogger, get_logger
 
 DIRECT_HISTORY_LIMIT = 6
 
@@ -99,25 +99,31 @@ Reply in 1-3 short sentences unless asked for more."""
 def build_supervisor(model_name: str = None):
     """Returns a model that produces a RouterDecision via structured output."""
     name = model_name or config.ollama.supervisor_model
-    model = ChatOllama(
-        model=name,
-        temperature=config.ollama.temperature,
-        num_ctx=config.ollama.num_ctx,
-        keep_alive="24h",  # mantem modelo carregado entre requests
+    # model = ChatOllama(
+    #     model=name,
+    #     temperature=config.ollama.temperature,
+    #     num_ctx=config.ollama.num_ctx,
+    #     keep_alive="24h",  # mantem modelo carregado entre requests
+    #     callbacks=[LLMLogger("supervisor")],
+    # )
+    model = ChatGoogleGenerativeAI(
+        model=config.gemini.model,
+        google_api_key=config.gemini.api_key,
+        temperature=config.gemini.temperature,
         callbacks=[LLMLogger("supervisor")],
     )
+
     return model.with_structured_output(RouterDecision)
 
 
 def build_direct(model_name: str = None):
     """Returns a plain LLM for direct conversational answers."""
     name = model_name or config.ollama.direct_model
-    return ChatOllama(
-        model=name,
-        temperature=config.ollama.temperature,
-        num_ctx=config.ollama.num_ctx,
-        keep_alive="24h",
-        callbacks=[LLMLogger("direct")],
+    return ChatGoogleGenerativeAI(
+        model=config.gemini.model,
+        google_api_key=config.gemini.api_key,
+        temperature=config.gemini.temperature,
+        callbacks=[LLMLogger("supervisor")],
     )
 
 
@@ -149,9 +155,40 @@ def build_graph(researcher, writer, mathy, supervisor, direct, knower, checkpoin
         response = await direct.ainvoke(messages)
         return {"messages": [AIMessage(content=response.content, name="direct")]}
 
-    def _wrap(sub_agent, name: str):
+    def _wrap(sub_agent, name: str, isolate: bool = False):
+        """Wrap a sub-agent as a graph node.
+
+        isolate=True: pass ONLY the last HumanMessage to the agent.
+        Use for retrieval agents (knower) to prevent conversation history from
+        a previous turn about topic A from biasing answers about topic B.
+
+        Tool-callback fix: LangGraph's ToolNode does not inherit callbacks
+        that are attached statically to the LLM model.  We pass a
+        ToolOnlyLogger via the invocation config so on_tool_start /
+        on_tool_end fire correctly inside create_react_agent, while all
+        LLM-level events continue to come from the model's own callback.
+        """
+        # Resolve once at build time — loggers are registered at import time.
+        _parent_logger = get_logger(name)
+        _tool_cb = ToolOnlyLogger(_parent_logger) if _parent_logger else None
+
         async def node(state: SupervisorState):
-            result = await sub_agent.ainvoke({"messages": state["messages"]})
+            if isolate:
+                # Retrieval agents must search fresh for each question.
+                # Sending the full history causes the LLM to hallucinate by
+                # reusing answers from previous turns about different topics.
+                last_human = next(
+                    (m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
+                    state["messages"][-1],
+                )
+                messages = [last_human]
+            else:
+                messages = state["messages"]
+
+            # Pass ToolOnlyLogger in the invocation config so LangGraph
+            # propagates it to ToolNode (and every other child node).
+            invoke_cfg = {"callbacks": [_tool_cb]} if _tool_cb else {}
+            result = await sub_agent.ainvoke({"messages": messages}, invoke_cfg or None)
             last = result["messages"][-1]
             return {
                 "messages": [AIMessage(content=last.content, name=name)],
@@ -165,7 +202,7 @@ def build_graph(researcher, writer, mathy, supervisor, direct, knower, checkpoin
     workflow.add_node("researcher", _wrap(researcher, "researcher"))
     workflow.add_node("writer", _wrap(writer, "writer"))
     workflow.add_node("mathy", _wrap(mathy, "mathy"))
-    workflow.add_node("knower", _wrap(knower, "knower"))
+    workflow.add_node("knower", _wrap(knower, "knower", isolate=True))
 
     workflow.add_edge(START, "supervisor")
     workflow.add_conditional_edges(

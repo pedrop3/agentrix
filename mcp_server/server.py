@@ -1,13 +1,11 @@
 """
-MCP server que expoe tools: search_notes, save_note, calc,
-web_fetcher, rag_search, rag_sources.
+MCP server que expoe tools: web_search, web_fetch, rag_search, rag_sources,
+rag_stats, kg_extract, kg_search_entity, kg_neighbors.
 
 Roda standalone: python -m mcp_server.server
-Ou e iniciado automaticamente pelo MultiServerMCPClient em main.py
+Ou e iniciado automaticamente pelo MultiServerMCPClient em server.py
 (via transport stdio).
 """
-import ast
-import operator
 import sys
 from pathlib import Path
 
@@ -15,155 +13,84 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-
 from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".env")
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 mcp = FastMCP("switchboard-tools")
 
-# Pasta onde as notas vivem (criada na primeira execucao)
 NOTES_DIR = Path(__file__).parent / "notes"
 NOTES_DIR.mkdir(exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# Tool 1: buscar notas
-# ---------------------------------------------------------------------------
-@mcp.tool()
-def search_notes(query: str) -> str:
-    """Search saved notes by keyword in title or content.
-
-    Returns matching notes with title and a content snippet.
-    Use this to find information the user previously saved.
-    """
-    q = query.lower().strip()
-    results = []
-    for note in NOTES_DIR.glob("*.md"):
-        content = note.read_text(encoding="utf-8")
-        if q in content.lower() or q in note.stem.lower():
-            snippet = content[:300] + ("..." if len(content) > 300 else "")
-            results.append(f"## {note.stem}\n{snippet}")
-
-    if not results:
-        return f"No notes found matching '{query}'."
-    return "\n\n---\n\n".join(results)
-
-
-# ---------------------------------------------------------------------------
-# Tool 2: salvar nota
-# ---------------------------------------------------------------------------
-@mcp.tool()
-def save_note(title: str, content: str) -> str:
-    """Save a note to disk with the given title and markdown content.
-
-    Use this when the user wants to save, write, or create a new note.
-    """
-    safe = "".join(c for c in title if c.isalnum() or c in " -_").strip()
-    if not safe:
-        return "Error: title must contain at least one alphanumeric character."
-    note_path = NOTES_DIR / f"{safe}.md"
-    note_path.write_text(content, encoding="utf-8")
-    return f"Note saved at {note_path.name} ({len(content)} chars)."
-
-
-# ---------------------------------------------------------------------------
-# Tool 3: calculadora segura (sem eval)
-# ---------------------------------------------------------------------------
-_OPS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-    ast.Pow: operator.pow,
-    ast.USub: operator.neg,
-    ast.UAdd: operator.pos,
-    ast.Mod: operator.mod,
-    ast.FloorDiv: operator.floordiv,
+# ─── Lexical-overlap guard (shared by rag_search) ─────────────────────────────
+_STOPWORDS_LEX = {
+    # PT — function words
+    "o", "a", "os", "as", "um", "uma", "uns", "umas", "de", "do", "da", "dos", "das",
+    "em", "no", "na", "nos", "nas", "para", "pra", "por", "com", "sem", "sobre", "ate",
+    "é", "e", "ou", "que", "qual", "quais", "como", "onde", "quando", "porque", "porquê",
+    "mais", "menos", "muito", "muita", "muitos", "muitas", "ser", "estar", "ter", "tem",
+    "são", "seu", "sua", "seus", "suas", "meu", "minha", "voce", "vocês", "este",
+    "esta", "esse", "essa", "isto", "isso", "aquele", "aquela", "aqui", "ali", "lá",
+    # EN — function words
+    "the", "a", "an", "of", "to", "in", "on", "at", "by", "for", "with", "from", "and",
+    "or", "but", "is", "are", "was", "were", "be", "been", "this", "that", "what",
+    "which", "how", "why", "when", "where", "who", "i", "you", "he", "she", "it", "we",
+    "they",
+    # Domain-generic banking / Portuguese terms — appear on every page and
+    # therefore carry no discriminating signal between different products.
+    # Without these, queries like "conta select criterios" share the token
+    # "conta" with ANY indexed page, causing false-positive RAG matches.
+    "conta", "banco", "abrir", "abertura", "titular", "deposito", "montante",
+    "cliente", "clientes", "produto", "produtos", "servico", "servicos",
+    "informacao", "informacoes", "documentos", "documentacao", "ficha",
+    "criterios", "requisitos", "condicoes", "condicao", "taxas", "custos",
+    "santander", "portugal", "bancario", "bancaria",
 }
 
 
-def _safe_eval(node):
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
-    if isinstance(node, ast.BinOp) and type(node.op) in _OPS:
-        return _OPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
-    if isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
-        return _OPS[type(node.op)](_safe_eval(node.operand))
-    raise ValueError(f"Unsupported expression element: {ast.dump(node)}")
+def _lexical_overlap_ok(query: str, text: str, min_overlap: int = 1) -> bool:
+    """True if at least `min_overlap` significant query terms appear in text."""
+    import re
+
+    def tokens(s: str) -> set[str]:
+        ws = re.findall(r"\w+", s.lower())
+        return {w for w in ws if len(w) >= 4 and w not in _STOPWORDS_LEX}
+
+    q = tokens(query)
+    if not q:
+        return True  # query is all stopwords — disable the filter
+    return len(q & tokens(text)) >= min_overlap
 
 
-@mcp.tool()
-def calc(expression: str) -> str:
-    """Evaluate a math expression safely.
-
-    Supports +, -, *, /, **, %, //, and parentheses.
-    Example: '23 * 47 + 100' returns '23 * 47 + 100 = 1181'.
-    """
-    try:
-        tree = ast.parse(expression, mode="eval")
-        result = _safe_eval(tree.body)
-        return f"{expression} = {result}"
-    except Exception as e:
-        return f"Error evaluating '{expression}': {e}"
-
-# ---------------------------------------------------------------------------
-# Tool 4: busca web restrita ao dominio configurado em WEB_DOMAIN
-# ---------------------------------------------------------------------------
-@mcp.tool()
+# ─── web_search ───────────────────────────────────────────────────────────────
+@mcp.tool(
+    title="Web Search (domain-restricted)",
+    description=(
+        "Search the configured web domain via DuckDuckGo (site:<domain>). "
+        "Call ONLY when rag_search returns no relevant results — web_search is "
+        "slower and has external side effects. "
+        "Results are auto-indexed in RAG so the same query is answered locally next time. "
+        "Returns: numbered list of {title, URL, snippet}. "
+        "If a result looks relevant, follow up with web_fetch to get the full content."
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,    # writes snippets to RAG
+        destructiveHint=False, # only additive (new RAG chunks)
+        idempotentHint=False,  # DDG results can vary over time
+        openWorldHint=True,    # calls external DuckDuckGo
+    ),
+)
 def web_search(query: str) -> str:
-    """Search the configured web domain for public information.
-
-    Strategy:
-      1. Try the local RAG first (cached pages + uploads). If hits, return them.
-      2. Otherwise, fall back to DuckDuckGo restricted to `site:<WEB_DOMAIN>`.
-         Snippet summary is auto-indexed in the RAG for future hits.
-
-    The domain is set by `WEB_DOMAIN` in `.env`.
-    Returns a numbered list of {title, url, snippet}.
-
-    Strategy (BUG FIX):
-      1. RAG-first SO com hits FORTES (score >= 0.65) de paginas REAIS (kind='web').
-         Snippets de busca antigos (kind='search_results') sao ignorados aqui
-         porque enganavam o agent.
-      2. Senao, vai pra DDG.
-    """
     from config import config
     from rag import get_rag
     from web_fetcher import search_site
 
     domain = config.web.domain
-    RAG_FIRST_MIN_SCORE = 0.65
-    RAG_FIRST_EXCLUDE = {"search_results"}
+    print(f"[web_search] querying DDG site:{domain!r} for: {query!r}")
 
-    # 1) RAG-first com criterio rigoroso (score + lexical overlap)
-    try:
-        rag = get_rag()
-        candidates = rag.search(
-            query,
-            k=6,
-            min_score=RAG_FIRST_MIN_SCORE,
-            exclude_kinds=RAG_FIRST_EXCLUDE,
-        )
-        local = [h for h in candidates if _lexical_overlap_ok(query, h.text)]
-        print(
-            f"[web_search] RAG hits >= {RAG_FIRST_MIN_SCORE}: {len(candidates)} "
-            f"(apos lexical filter: {len(local)})"
-        )
-        if local:
-            lines = [f"# [Origem: RAG local] Resultados confidentes em {domain}:"]
-            for i, h in enumerate(local[:3], 1):
-                snippet = h.text[:250].replace("\n", " ")
-                lines.append(
-                    f"{i}. {h.source}  (kind={h.kind}, score={h.score:.3f})\n   {snippet}..."
-                )
-            return "\n\n".join(lines)
-    except Exception as e:
-        print(f"[web_search] RAG check failed, going web: {e}")
-
-    # 2) Web fallback (DDG + indexa snippets pro RAG)
-    print(f"[web_search] going to DDG for: {query!r}")
     try:
         results = search_site(query, max_results=6)
     except Exception as e:
@@ -174,6 +101,8 @@ def web_search(query: str) -> str:
             f"No results found on {domain} for '{query}'. "
             f"If you know a relevant URL on {domain}, call `web_fetch(url)` directly."
         )
+
+    print(f"[web_search] found {len(results)} results.")
 
     try:
         rag = get_rag()
@@ -195,17 +124,25 @@ def web_search(query: str) -> str:
     return "\n\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Tool 5: fetch de uma URL no dominio configurado e indexa no RAG
-# ---------------------------------------------------------------------------
-@mcp.tool()
+# ─── web_fetch ────────────────────────────────────────────────────────────────
+@mcp.tool(
+    title="Web Fetch (full page)",
+    description=(
+        "Download the full text of a specific URL (HTML or PDF) from the configured domain. "
+        "Use after web_search reveals a relevant URL, or when you already know the URL. "
+        "Limit to 2 fetches per question — each fetch is a network call. "
+        "Content is automatically indexed in RAG so future questions hit the local cache. "
+        "Returns: page title + full text (up to 6000 chars). "
+        "After fetching, answer from the returned content — do NOT call rag_search again."
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,   # writes page content to RAG
+        destructiveHint=False,
+        idempotentHint=True,  # fetching the same URL twice is safe
+        openWorldHint=True,   # makes an outbound HTTP request
+    ),
+)
 def web_fetch(url: str) -> str:
-    """Fetch a page (HTML or PDF) inside the configured domain and return its
-    clean text. The content is automatically indexed in the RAG so future
-    questions hit the cache.
-
-    The URL must belong to one of the allowed hosts (WEB_ALLOWED_HOSTS).
-    """
     from config import config
     from rag import get_rag
     from web_fetcher import fetch_url
@@ -237,90 +174,80 @@ def web_fetch(url: str) -> str:
     return f"# {page.title}\n{page.url} ({page.kind})\n{indexing_note}\n\n{body}"
 
 
-# ---------------------------------------------------------------------------
-# Tool 6: busca semantica no RAG (uploads + paginas ja fetchadas)
-# ---------------------------------------------------------------------------
-# Stopwords PT/EN minimas — descartadas no lexical-overlap check
-_STOPWORDS_LEX = {
-    # PT
-    "o", "a", "os", "as", "um", "uma", "uns", "umas", "de", "do", "da", "dos", "das",
-    "em", "no", "na", "nos", "nas", "para", "pra", "por", "com", "sem", "sobre", "ate",
-    "é", "e", "ou", "que", "qual", "quais", "como", "onde", "quando", "porque", "porquê",
-    "mais", "menos", "muito", "muita", "muitos", "muitas", "ser", "estar", "ter", "tem",
-    "tem", "são", "seu", "sua", "seus", "suas", "meu", "minha", "voce", "vocês", "este",
-    "esta", "esse", "essa", "isto", "isso", "aquele", "aquela", "aqui", "ali", "lá",
-    # EN
-    "the", "a", "an", "of", "to", "in", "on", "at", "by", "for", "with", "from", "and",
-    "or", "but", "is", "are", "was", "were", "be", "been", "this", "that", "what",
-    "which", "how", "why", "when", "where", "who", "i", "you", "he", "she", "it", "we",
-    "they",
-}
-
-
-def _lexical_overlap_ok(query: str, text: str, min_overlap: int = 1) -> bool:
-    """Verifica se ao menos `min_overlap` termos significativos da query aparecem
-    no texto. Evita que o vector search retorne chunks "proximos no espaco
-    vetorial" mas semanticamente errados."""
-    import re
-
-    def tokens(s: str) -> set[str]:
-        ws = re.findall(r"\w+", s.lower())
-        return {w for w in ws if len(w) >= 4 and w not in _STOPWORDS_LEX}
-
-    q = tokens(query)
-    if not q:  # query so com stopwords/curtas — desliga o filtro
-        return True
-    t = tokens(text)
-    return len(q & t) >= min_overlap
-
-
-@mcp.tool()
+# ─── rag_search ───────────────────────────────────────────────────────────────
+@mcp.tool(
+    title="RAG Search (local cache)",
+    description=(
+        "Hybrid search (vector + fulltext) over locally cached content "
+        "(user uploads + previously fetched pages). "
+        "ALWAYS call this FIRST before going to the web — it is fast, free, and offline. "
+        "Uses vector similarity + Lucene fulltext fused with RRF, then a domain-aware "
+        "lexical guard to reject off-topic chunks. "
+        "If the returned chunks clearly answer the question, use them directly. "
+        "If results are empty or the key product identifier is absent, fall through to web_search."
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
 def rag_search(query: str, k: int = 5) -> str:
-    """Semantic search over indexed content (uploads + fetched pages).
-
-    Returns top-k chunks ranked by cosine similarity, com DUAS guards:
-      - score >= 0.6 (filtro semantico)
-      - overlap lexical com a query (pelo menos 1 palavra significativa em
-        comum) — pra evitar falso-positivo do vector search em indice pequeno.
-
-    Use this BEFORE going to web — if there's a confident hit, answer
-    from it. If nothing relevant comes back, fall back to `web_search`.
-    """
     from rag import get_rag
 
-    MIN_SCORE = 0.6
     try:
         rag = get_rag()
-        raw_hits = rag.search(query, k=k * 2, min_score=MIN_SCORE)  # over-fetch
+        # hybrid_search fuses vector cosine + Lucene fulltext via RRF, then keeps
+        # only chunks that appear in the fulltext results OR have a very strong
+        # vector score (>= 0.80). This eliminates pure-vector false positives
+        # without discarding chunks that are lexically on-topic.
+        raw_hits = rag.hybrid_search(
+            query,
+            k=k * 2,
+            require_lexical=True,
+            min_vector_score=0.5,   # pre-filter for the vector arm of RRF
+            
+        )
     except Exception as e:
         return f"Error querying RAG: {e}"
 
     if not raw_hits:
-        return f"No indexed content matches '{query}' (above min_score={MIN_SCORE})."
+        return f"No indexed content matches '{query}'."
 
-    # Filtro lexical: chunk precisa partilhar pelo menos 1 palavra-chave da query
-    filtered = [h for h in raw_hits if _lexical_overlap_ok(query, h.text)]
+    # Secondary domain-aware guard: removes chunks that share no significant
+    # product-specific term with the query (e.g. rejects "Conta Jovem" content
+    # when the query is about "Conta Select", since after stripping generic
+    # banking stopwords the only discriminating token is the product identifier).
+    filtered = [h for h in raw_hits if _lexical_overlap_ok(query, h.text, min_overlap=1)]
     discarded = len(raw_hits) - len(filtered)
 
     if not filtered:
         return (
             f"No indexed content matches '{query}' "
-            f"({len(raw_hits)} chunks tinham score>={MIN_SCORE} mas nenhum tinha "
-            f"overlap lexical — provavelmente sao chunks tematicamente distantes). "
-            f"Try `web_search` instead."
+            f"({len(raw_hits)} candidate(s) found but none shared the key product "
+            f"identifier with the query). Try `web_search` instead."
         )
 
-    head = f"# {len(filtered)} hit(s) relevantes (descartei {discarded} sem overlap lexical):"
+    head = f"# {len(filtered)} hit(s) (discarded {discarded} off-topic):"
     body = "\n\n---\n\n".join(h.to_block() for h in filtered[:k])
     return f"{head}\n\n{body}"
 
 
-# ---------------------------------------------------------------------------
-# Tool 7: lista as fontes indexadas (debug / inspeção)
-# ---------------------------------------------------------------------------
-@mcp.tool()
+# ─── rag_sources ──────────────────────────────────────────────────────────────
+@mcp.tool(
+    title="RAG Sources (debug)",
+    description=(
+        "List all unique source URLs currently indexed in the local RAG store. "
+        "Use for debugging to check what has already been fetched/uploaded. "
+        "NOT intended for answering user questions."
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
 def rag_sources() -> str:
-    """List all unique sources currently indexed in the RAG store."""
     from rag import get_rag
 
     try:
@@ -335,13 +262,21 @@ def rag_sources() -> str:
     return f"{total} chunks total across {len(sources)} sources:\n{listing}"
 
 
-@mcp.tool()
+# ─── rag_stats ────────────────────────────────────────────────────────────────
+@mcp.tool(
+    title="RAG Stats (debug)",
+    description=(
+        "Diagnostic: chunk counts by kind, total sources, entity and mention counts. "
+        "Use when the agent's answers look wrong or to verify the knowledge graph was built. "
+        "NOT intended for answering user questions."
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
 def rag_stats() -> str:
-    """Diagnostic: counts of chunks (by kind), sources, entities and mentions.
-
-    Use this when the agent's behavior looks weird — it shows what is
-    actually indexed and whether the knowledge graph has been populated.
-    """
     from rag import get_rag
 
     try:
@@ -359,20 +294,25 @@ def rag_stats() -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Tool 8: extrai entidades bancárias dos chunks pendentes (LLM -> Neo4j)
-# ---------------------------------------------------------------------------
-@mcp.tool()
+# ─── kg_extract ───────────────────────────────────────────────────────────────
+@mcp.tool(
+    title="Knowledge Graph Extract (expensive)",
+    description=(
+        "EXPENSIVE: runs one LLM call per chunk to extract entities "
+        "(Product/Fee/Requirement/Benefit/Channel/Customer) into the knowledge graph. "
+        "Use sparingly — only after web_fetch when kg_search_entity returns nothing "
+        "and you need structured attribute data (fees, requirements, benefits). "
+        "Already-processed chunks are skipped, so re-running the same source is safe. "
+        "Returns: counts of nodes and relationships created."
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,    # writes to the knowledge graph
+        destructiveHint=False, # additive only
+        idempotentHint=True,   # re-processing same chunks is a no-op
+        openWorldHint=False,
+    ),
+)
 def kg_extract(source: str = "", limit: int = 20) -> str:
-    """Extract banking entities (Product/Fee/Requirement/Benefit/Channel/Customer)
-    from indexed chunks that haven't been processed yet.
-
-    - If `source` is given, only chunks of that source are processed.
-    - Otherwise, processes any pending chunk (max `limit`).
-
-    This is heavy (one LLM call per chunk). Use sparingly. Returns a summary
-    with counts of nodes and relationships created.
-    """
     from kg_extract import extract_for_source
 
     try:
@@ -385,17 +325,24 @@ def kg_extract(source: str = "", limit: int = 20) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Tool 9: busca uma entidade por nome aproximado
-# ---------------------------------------------------------------------------
-@mcp.tool()
+# ─── kg_search_entity ─────────────────────────────────────────────────────────
+@mcp.tool(
+    title="Knowledge Graph — Find Entity",
+    description=(
+        "Find entities in the knowledge graph by name substring (case-insensitive). "
+        "Best first step when the question is about comparing products, listing "
+        "requirements, or looking up fees/benefits for a named product. "
+        "Returns entity type labels and mention counts. "
+        "If a match is found, call kg_neighbors on the exact name to get its attributes. "
+        "If empty, skip to rag_search — the KG may not have been populated yet."
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
 def kg_search_entity(name: str, limit: int = 10) -> str:
-    """Find banking entities whose name matches the given substring (case-insensitive).
-
-    Returns a list of {labels, name, sources_mentioning_it_count}.
-    Use this to discover canonical product/fee/requirement names before
-    asking for neighbors.
-    """
     from rag import get_rag
 
     rag = get_rag()
@@ -422,19 +369,23 @@ def kg_search_entity(name: str, limit: int = 10) -> str:
     return "\n".join(f"- {':'.join(labels)} '{n}' (mentions: {m})" for labels, n, m in rows)
 
 
-# ---------------------------------------------------------------------------
-# Tool 10: vizinhos no grafo (1 hop) de uma entidade
-# ---------------------------------------------------------------------------
-@mcp.tool()
+# ─── kg_neighbors ─────────────────────────────────────────────────────────────
+@mcp.tool(
+    title="Knowledge Graph — Entity Neighbors",
+    description=(
+        "Get all outgoing relationships of a named entity (1-hop neighbors). "
+        "Call after kg_search_entity confirms the exact entity name. "
+        "Returns linked fees, requirements, benefits, and channels as labeled triples — "
+        "ideal for questions about what a product costs, requires, or offers. "
+        "If the entity has no neighbors, the KG is sparse — fall back to rag_search."
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
 def kg_neighbors(name: str) -> str:
-    """Return the 1-hop neighbors of an entity in the knowledge graph.
-
-    Example output for name="Cartão Gold":
-      Cartão Gold (:Product)
-        -[HAS_FEE]->  Anuidade 35€ (:Fee)
-        -[OFFERS]->   Seguro de viagem (:Benefit)
-        -[REQUIRES]-> Rendimento 1000€ (:Requirement)
-    """
     from rag import get_rag
 
     rag = get_rag()
@@ -466,5 +417,4 @@ def kg_neighbors(name: str) -> str:
 
 
 if __name__ == "__main__":
-    # Stdio transport: o cliente (langchain-mcp-adapters) sobe esse processo
     mcp.run(transport="stdio")
