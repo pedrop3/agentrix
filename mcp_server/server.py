@@ -6,7 +6,10 @@ Roda standalone: python -m mcp_server.server
 Ou e iniciado automaticamente pelo MultiServerMCPClient em server.py
 (via transport stdio).
 """
+import logging
 import sys
+import threading
+import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -16,6 +19,13 @@ if str(PROJECT_ROOT) not in sys.path:
 from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".env")
 
+# ─── Suprimir logs verbosos do protocolo MCP (stdio) ─────────────────────────
+# O FastMCP loga "Processing request of type …" em INFO por defeito —
+# polui o output do agente intercalado com os steps numerados.
+for _mcp_logger in ("mcp", "mcp.server", "mcp.server.fastmcp",
+                    "mcp.server.session", "mcp.shared"):
+    logging.getLogger(_mcp_logger).setLevel(logging.WARNING)
+
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
@@ -23,6 +33,41 @@ mcp = FastMCP("switchboard-tools")
 
 NOTES_DIR = Path(__file__).parent / "notes"
 NOTES_DIR.mkdir(exist_ok=True)
+
+# ─── Circuit breaker: web_search ─────────────────────────────────────────────
+# Se a rede externa estiver inacessível, bloqueia novas tentativas por
+# _WEB_BACKOFF_SECS para não desperdiçar tempo com timeouts repetidos.
+_web_unavailable_until: float = 0.0
+_WEB_BACKOFF_SECS: float = 120.0   # 2 minutos entre retentativas
+
+# ─── Background KG extraction ─────────────────────────────────────────────────
+# Lock não-bloqueante: se já houver extracção a correr, a nova é saltada
+# em vez de ficar em fila (evita saturar o Ollama com pedidos paralelos).
+_kg_extract_lock = threading.Lock()
+
+
+def _bg_kg_extract(source: str) -> None:
+    """Extrai entidades para o grafo em background (thread daemon).
+
+    Corre após cada web_fetch bem-sucedido para manter o knowledge graph
+    actualizado sem bloquear a resposta ao utilizador.
+    """
+    if not _kg_extract_lock.acquire(blocking=False):
+        print(f"[kg] ⬡ skipped (busy): {source[:60]}")
+        return
+    try:
+        from kg_extract import extract_for_source
+        totals = extract_for_source(source=source, limit=20)
+        if totals["nodes"] or totals["rels"]:
+            print(
+                f"[kg] ⬡ {source[:55]}"
+                f"  → {totals['nodes']} nodes  {totals['rels']} rels"
+                f"  ({totals['chunks']} chunks)"
+            )
+    except Exception as e:
+        print(f"[kg] ⬡ extract error ({source[:40]}): {e}")
+    finally:
+        _kg_extract_lock.release()
 
 
 # ─── Lexical-overlap guard (shared by rag_search) ─────────────────────────────
@@ -84,16 +129,31 @@ def _lexical_overlap_ok(query: str, text: str, min_overlap: int = 1) -> bool:
     ),
 )
 def web_search(query: str) -> str:
+    global _web_unavailable_until
+
     from config import config
     from rag import get_rag
     from web_fetcher import search_site
 
     domain = config.web.domain
+
+    # Circuit breaker: se houve erro de rede recente, não tenta de novo
+    if time.time() < _web_unavailable_until:
+        remaining = int(_web_unavailable_until - time.time())
+        return (
+            f"External search is currently unavailable (network error; retry in ~{remaining}s). "
+            f"If you know a relevant URL on {domain}, call web_fetch directly."
+        )
+
     print(f"[web_search] querying DDG site:{domain!r} for: {query!r}")
 
     try:
         results = search_site(query, max_results=6)
     except Exception as e:
+        err = str(e).lower()
+        if any(k in err for k in ("unreachable", "errno 51", "timed out", "timeout", "connect")):
+            _web_unavailable_until = time.time() + _WEB_BACKOFF_SECS
+            print(f"[web_search] network unavailable — circuit open for {_WEB_BACKOFF_SECS:.0f}s")
         return f"Error searching {domain}: {e}"
 
     if not results:
@@ -167,6 +227,12 @@ def web_fetch(url: str) -> str:
             },
         )
         indexing_note = f"(indexed {chunks} chunks in RAG, source={page.url})"
+        # ── Background KG extraction ────────────────────────────────────────
+        # Corre em daemon thread para não atrasar a resposta ao utilizador.
+        # O knowledge graph fica actualizado para perguntas futuras.
+        threading.Thread(
+            target=_bg_kg_extract, args=(page.url,), daemon=True
+        ).start()
     except Exception as e:
         indexing_note = f"(RAG indexing failed: {e})"
 
@@ -205,8 +271,8 @@ def rag_search(query: str, k: int = 5) -> str:
             query,
             k=k * 2,
             require_lexical=True,
-            min_vector_score=0.5,   # pre-filter for the vector arm of RRF
-            
+            min_vector_score=0.5,           # pre-filter for the vector arm of RRF
+            exclude_kinds=["search_results"],  # snippets DDG são ruído — só conteúdo real
         )
     except Exception as e:
         return f"Error querying RAG: {e}"

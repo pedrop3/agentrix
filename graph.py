@@ -87,7 +87,7 @@ You MUST return valid JSON with fields {{"next": "...", "reason": "..."}}.
 # mantido por compat — modulos que importam SUPERVISOR_PROMPT continuam funcionando
 SUPERVISOR_PROMPT = _supervisor_prompt()
 
-DIRECT_PROMPT = """/no_think
+DIRECT_PROMPT = """
 You are a helpful assistant. Answer the user's question directly and concisely
 using the conversation history as context. Do not use any tools.
 Reply in 1-3 short sentences unless asked for more."""
@@ -136,7 +136,7 @@ class SupervisorState(MessagesState):
 def build_graph(researcher, writer, mathy, supervisor, direct, knower, checkpointer=None):
     def supervisor_node(state: SupervisorState):
         last = state["messages"][-1]
-        if getattr(last, "name", None) in ("researcher", "writer", "mathy", "knower", "direct"):
+        if getattr(last, "name", None) in ("knower", "direct"):
             print("[supervisor] -> END  (agent already responded)")
             return {"next": "END"}
         # Pra rotear, o supervisor so precisa da MENSAGEM ATUAL do usuario.

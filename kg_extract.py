@@ -1,6 +1,5 @@
 """
-Extração de entidades + relações em texto bancário (Bank) e inserção
-no grafo Neo4j.
+Extração de entidades + relações em texto bancário e inserção no grafo Neo4j.
 
 Schema FIXO (`ALLOWED_NODES` / `ALLOWED_RELS`) — propositadamente pequeno
 pra evitar grafo barulhento. Cada chunk processado vira:
@@ -15,7 +14,8 @@ E relações de domínio entre as próprias entidades, ex.:
     (:Product)-[:AVAILABLE_IN]->(:Channel)
     (:Product)-[:FOR_SEGMENT]->(:Customer)
 
-O LLM (qwen3:8b via Ollama) é forçado a devolver JSON estruturado.
+LLM: Gemini (ChatGoogleGenerativeAI) com response_mime_type=application/json
+para forçar output JSON estruturado sem depender de Ollama.
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from langchain_ollama import ChatOllama
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 from config import config
 
@@ -39,10 +39,9 @@ ALLOWED_RELS = [
 
 
 def _extraction_prompt() -> str:
-    """Prompt da extracao com display_name/dominio/idioma vindos do config."""
+    """Prompt da extracção com display_name/domínio/idioma vindos do config."""
     web = config.web
     return (
-        "/no_think\n"
         "You extract a small product knowledge graph from text about "
         f"{web.display_name} (source: {web.domain}).\n\n"
         "Allowed node types (use ONLY these):\n"
@@ -62,8 +61,8 @@ def _extraction_prompt() -> str:
         "- Be conservative. If unsure, omit. Empty result is fine.\n"
         f"- Use the canonical name in {web.language} as `name`. No quotes, no fluff.\n"
         "- For Fee, include amount/currency/frequency in `properties` if mentioned.\n"
-        "- Output STRICT JSON only — no commentary, no markdown fences.\n\n"
-        "Output schema (placeholders shown):\n"
+        "- Return ONLY valid JSON matching the schema below. No commentary.\n\n"
+        "Output schema:\n"
         '{ "nodes": [ {"label": "Product", "name": "<product name>", "properties": {}} ],\n'
         '  "relationships": [ {"source": {"label": "Product", "name": "<product>"},\n'
         '                       "type": "HAS_FEE",\n'
@@ -78,15 +77,18 @@ class GraphDoc:
     relationships: list[dict]
 
 
-def _llm(model_name: str = None) -> ChatOllama:
-    name = model_name or config.ollama.extract_model
-    return ChatOllama(
-        model=name,
-        temperature=config.ollama.temperature,
-        format="json",
-        num_ctx=config.ollama.num_ctx,
-    )
+def _llm(model_name: str = None) -> ChatGoogleGenerativeAI:
+    """Devolve o LLM de extracção (Gemini).
 
+    `response_mime_type=application/json` força o modelo a devolver JSON
+    válido sem markdown fences — substitui o `format='json'` do Ollama.
+    O parâmetro `model_name` é mantido por compatibilidade mas ignorado.
+    """
+    return ChatGoogleGenerativeAI(
+        model=config.gemini.model,
+        google_api_key=config.gemini.api_key,
+        temperature=0,
+    )
 
 def _normalize_name(name: str) -> str:
     """Reduz variações triviais pra que MERGE não duplique 'Cartão Gold' e 'Cartao Gold '. """
@@ -105,12 +107,23 @@ def extract_from_text(text: str, model_name: str = None) -> GraphDoc:
     llm = _llm(model_name)
     prompt = _extraction_prompt().replace("{TEXT}", text[:3500])
     resp = llm.invoke(prompt)
+
+    # Normaliza o conteúdo da resposta para string:
+    # Gemini devolve lista de blocos [{"type":"text","text":"..."}] quando
+    # response_mime_type=application/json está activo.
     raw = resp.content if hasattr(resp, "content") else str(resp)
+    if isinstance(raw, list):
+        raw = " ".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in raw
+        ).strip()
+    else:
+        raw = str(raw).strip()
 
     try:
         data = json.loads(raw)
     except Exception:
-        # tenta caçar o primeiro JSON object dentro do texto
+        # Fallback: tenta caçar o primeiro JSON object dentro do texto
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if not m:
             return GraphDoc(nodes=[], relationships=[])

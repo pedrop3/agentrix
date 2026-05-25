@@ -70,6 +70,44 @@ def _strip_think(text: str) -> tuple[str, str]:
     return think, visible
 
 
+def _split_gemini_content(msg) -> tuple[str, str]:
+    """Split an LLM message into (thought, visible) parts.
+
+    - Ollama / plain string  → delegates to _strip_think (handles qwen3 <think> tags).
+    - Gemini list blocks     → separates blocks where ``thought=True`` from normal text.
+    - Mixed                  → merges both sources of thinking.
+    Returns (thought_text, visible_text).
+    """
+    c = getattr(msg, "content", "")
+    if not isinstance(c, list):
+        # Plain string content — handle qwen3-style <think> tags
+        return _strip_think(str(c).strip())
+
+    # Gemini-style: content is a list of typed blocks
+    thought_parts: list[str] = []
+    visible_parts: list[str] = []
+    for block in c:
+        if isinstance(block, dict):
+            text = block.get("text", "")
+            if block.get("thought", False):
+                thought_parts.append(text)
+            else:
+                visible_parts.append(text)
+        else:
+            visible_parts.append(str(block))
+
+    thought = " ".join(p for p in thought_parts if p).strip()
+    visible = " ".join(p for p in visible_parts if p).strip()
+
+    # Also strip any qwen3-style tags that might appear inside visible text
+    if "<think>" in visible:
+        extra_think, visible = _strip_think(visible)
+        if extra_think:
+            thought = (thought + " " + extra_think).strip()
+
+    return thought, visible
+
+
 def _content(msg) -> str:
     c = getattr(msg, "content", "")
     if isinstance(c, list):
@@ -139,7 +177,7 @@ def _extract_text(raw) -> str:
     return str(raw)
 
 
-def _fmt_result(raw, max_len: int = 220) -> str:
+def _fmt_result(raw, max_len: int = 400) -> str:
     """Collapse whitespace and truncate tool output for display."""
     text = _extract_text(raw)
     text = " ".join(text.split())   # normalise whitespace
@@ -203,19 +241,32 @@ class LLMLogger(BaseCallbackHandler):
             return  # routing decision is printed by graph.py
 
         tool_calls: list[dict] = []
+        thinking_text = ""
         visible_text = ""
 
         for gens in response.generations:
             for gen in gens:
                 msg = getattr(gen, "message", None)
                 tool_calls.extend(getattr(msg, "tool_calls", []) if msg else [])
-                text = (_content(msg) if msg else getattr(gen, "text", "")).strip()
-                _, visible = _strip_think(text)
+                if msg:
+                    thought, visible = _split_gemini_content(msg)
+                else:
+                    text = getattr(gen, "text", "").strip()
+                    thought, visible = _strip_think(text)
+                if thought:
+                    thinking_text += thought + "\n"
                 if visible:
                     visible_text += visible + "\n"
 
+        thinking_text = thinking_text.strip()
         visible_text = visible_text.strip()
 
+        if thinking_text:
+            # Show a single-line preview of the model's internal reasoning
+            short = textwrap.shorten(
+                thinking_text.replace("\n", " "), width=W - 6, placeholder="…"
+            )
+            print(f"  ┆ {short}")
         if tool_calls and visible_text:
             # Agent narrated its reasoning before the tool call
             short = textwrap.shorten(visible_text, width=W - 5, placeholder="…")
@@ -261,15 +312,22 @@ class LLMLogger(BaseCallbackHandler):
             _turn_breakdown[f"tool:{name}"] += elapsed
             _turn_calls[f"tool:{name}"] += 1
 
-        result = _fmt_result(output)   # handles ToolMessage, str, content-block lists
+        full = _fmt_result(output)     # handles ToolMessage, str, content-block lists
         timing = f"{elapsed:.2f}s"
-        available = W - 7 - len(timing)
-        if len(result) < available:
-            padding = " " * (available - len(result))
-        else:
-            result = result[:available - 1] + "…"
-            padding = " "
-        print(f"     ╰ {result}{padding}{timing}")
+        first_w = W - 7 - len(timing)  # chars available on the first line
+
+        first = full[:first_w]
+        rest  = full[first_w:]
+
+        # First line: result + right-aligned timing (always W chars wide)
+        pad = " " * (first_w - len(first)) if len(first) < first_w else " "
+        print(f"     ╰ {first}{pad}{timing}")
+
+        # Optional continuation line — shows the next slice of the result
+        if rest:
+            cont = rest[:first_w]
+            ellipsis = "…" if len(rest) > first_w else ""
+            print(f"       {cont}{ellipsis}")
 
     def on_tool_error(self, error, **kwargs):
         run_id = str(kwargs.get("run_id", ""))
