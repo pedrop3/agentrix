@@ -10,6 +10,7 @@ import logging
 import sys
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -96,12 +97,22 @@ _STOPWORDS_LEX = {
 }
 
 
+def _strip_accents(s: str) -> str:
+    """Remove diacritics: 'cartão' → 'cartao', 'crédito' → 'credito'."""
+    return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode("ascii")
+
+
 def _lexical_overlap_ok(query: str, text: str, min_overlap: int = 1) -> bool:
-    """True if at least `min_overlap` significant query terms appear in text."""
+    """True if at least `min_overlap` significant query terms appear in text.
+
+    Accent-insensitive: 'cartao' matches 'cartão', 'credito' matches 'crédito'.
+    Users often type without accents; chunks always have them — without this
+    normalisation every query without accents produces a false miss.
+    """
     import re
 
     def tokens(s: str) -> set[str]:
-        ws = re.findall(r"\w+", s.lower())
+        ws = re.findall(r"\w+", _strip_accents(s).lower())
         return {w for w in ws if len(w) >= 4 and w not in _STOPWORDS_LEX}
 
     q = tokens(query)
@@ -247,10 +258,14 @@ def web_fetch(url: str) -> str:
         "Hybrid search (vector + fulltext) over locally cached content "
         "(user uploads + previously fetched pages). "
         "ALWAYS call this FIRST before going to the web — it is fast, free, and offline. "
+        "Query must be a short natural-language question or phrase — "
+        "do NOT use DDG-style operators (site:, OR, AND, quotes). "
         "Uses vector similarity + Lucene fulltext fused with RRF, then a domain-aware "
         "lexical guard to reject off-topic chunks. "
-        "If the returned chunks clearly answer the question, use them directly. "
-        "If results are empty or the key product identifier is absent, fall through to web_search."
+        "If the returned chunks clearly answer the question, STOP and use them — "
+        "do not escalate to web_search. "
+        "Only fall through to web_search if results are empty or every chunk is "
+        "clearly about a different product (key identifier absent)."
     ),
     annotations=ToolAnnotations(
         readOnlyHint=True,
@@ -258,7 +273,7 @@ def web_fetch(url: str) -> str:
         openWorldHint=False,
     ),
 )
-def rag_search(query: str, k: int = 5) -> str:
+def rag_search(query: str, k: int = 7) -> str:
     from rag import get_rag
 
     try:
@@ -294,8 +309,11 @@ def rag_search(query: str, k: int = 5) -> str:
             f"identifier with the query). Try `web_search` instead."
         )
 
-    head = f"# {len(filtered)} hit(s) (discarded {discarded} off-topic):"
-    body = "\n\n---\n\n".join(h.to_block() for h in filtered[:k])
+    returned = filtered[:k]
+    extra = len(filtered) - len(returned)
+    extra_note = f", {extra} more omitted" if extra else ""
+    head = f"# {len(returned)} hit(s) (discarded {discarded} off-topic{extra_note}):"
+    body = "\n\n---\n\n".join(h.to_block() for h in returned)
     return f"{head}\n\n{body}"
 
 
@@ -366,8 +384,10 @@ def rag_stats() -> str:
     description=(
         "EXPENSIVE: runs one LLM call per chunk to extract entities "
         "(Product/Fee/Requirement/Benefit/Channel/Customer) into the knowledge graph. "
-        "Use sparingly — only after web_fetch when kg_search_entity returns nothing "
-        "and you need structured attribute data (fees, requirements, benefits). "
+        "NOTE: extraction runs automatically in the background after every web_fetch — "
+        "you usually do NOT need to call this manually. "
+        "Only call explicitly when kg_search_entity returns nothing for a source that "
+        "was indexed before background extraction was active. "
         "Already-processed chunks are skipped, so re-running the same source is safe. "
         "Returns: counts of nodes and relationships created."
     ),
