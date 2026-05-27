@@ -1,14 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import textwrap
 import threading
 import time
 from collections import defaultdict
+from contextvars import ContextVar
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import HumanMessage
+
+# ─── Per-request AG-UI tool event queue ───────────────────────────────────────
+# server.py sets this ContextVar before streaming; LLMLogger drains it to emit
+# TOOL_CALL_START / TOOL_CALL_END events without touching the graph architecture.
+_tool_event_queue: ContextVar[asyncio.Queue | None] = ContextVar(
+    "_tool_event_queue", default=None
+)
 
 W = 78  # line width
 
@@ -303,6 +312,11 @@ class LLMLogger(BaseCallbackHandler):
         args = _fmt_tool_input(str(input_str))
         print(f" {step:>2}  {name}  {args}")
 
+        # AG-UI: emitir evento para o stream SSE
+        q = _tool_event_queue.get()
+        if q is not None:
+            q.put_nowait({"type": "TOOL_CALL_START", "toolCallId": run_id, "toolCallName": name})
+
     def on_tool_end(self, output, **kwargs):
         run_id = str(kwargs.get("run_id", ""))
         info = self._tool_t0.pop(run_id, None)
@@ -328,12 +342,20 @@ class LLMLogger(BaseCallbackHandler):
             cont = rest[:first_w]
             ellipsis = "…" if len(rest) > first_w else ""
             print(f"       {cont}{ellipsis}")
+        # AG-UI: emitir evento para o stream SSE
+        q = _tool_event_queue.get()
+        if q is not None:
+            q.put_nowait({"type": "TOOL_CALL_END", "toolCallId": run_id})
 
     def on_tool_error(self, error, **kwargs):
         run_id = str(kwargs.get("run_id", ""))
         info = self._tool_t0.pop(run_id, None)
         elapsed = (time.perf_counter() - info[0]) if info else 0.0
         print(f"     ╰ ✗ {error}  ({elapsed:.2f}s)")
+        # AG-UI: fechar a tool call mesmo em caso de erro
+        q = _tool_event_queue.get()
+        if q is not None:
+            q.put_nowait({"type": "TOOL_CALL_END", "toolCallId": run_id})
 
 
 # ─── ToolOnlyLogger ───────────────────────────────────────────────────────────
