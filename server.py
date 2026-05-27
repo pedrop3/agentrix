@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Optional
 
@@ -16,6 +17,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import BaseModel
 
 from agents.knower import build_knower
+from logger import _tool_event_queue
 from agents.mathy import build_mathy
 from agents.researcher import build_researcher
 from agents.writer import build_writer
@@ -145,6 +147,11 @@ def _config_for(body: ChatBody) -> dict:
 
 
 
+def _sse(data: dict) -> bytes:
+    """Encode a dict as a Server-Sent Event data line (AG-UI format)."""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
 @app.get("/health")
 async def health():
     return {
@@ -177,10 +184,25 @@ async def chat_stream(body: ChatBody, request: Request):
     user_msg = _build_user_message(body)
 
     async def event_source() -> AsyncIterator[bytes]:
+        run_id = str(uuid.uuid4())
+        current_msg_id: str | None = None
+
+        # Fila de eventos de tool calls populada pelos callbacks LLMLogger/ToolOnlyLogger.
+        # Necessário porque _wrap usa ainvoke — os tool calls do knower são invisíveis
+        # ao stream do grafo pai; apenas os callbacks conseguem interceptá.
+        tool_q: asyncio.Queue = asyncio.Queue()
+        ctx_token = _tool_event_queue.set(tool_q)
+
+        def _drain_tool_queue():
+            """Yield all pending tool events from the queue (non-blocking)."""
+            events = []
+            while not tool_q.empty():
+                events.append(tool_q.get_nowait())
+            return events
+
+        yield _sse({"type": "RUN_STARTED", "runId": run_id, "threadId": body.conversationId})
+
         try:
-            # stream_mode="messages" emite tuplas (chunk_de_mensagem, metadata)
-            # com `metadata["langgraph_node"]` indicando o no que esta falando.
-            # Filtramos o supervisor (saida structured) e propagamos so o resto.
             async for chunk, metadata in graph.astream(
                 {"messages": [user_msg]},
                 config=run_config,
@@ -191,32 +213,62 @@ async def chat_stream(body: ChatBody, request: Request):
 
                 node = (metadata or {}).get("langgraph_node")
                 if node == "supervisor":
-                    # supervisor usa structured output (RouterDecision); nao vaza pro usuario
                     continue
 
-                # chunk pode ser AIMessageChunk ou ToolMessage; pegamos so texto
-                delta = getattr(chunk, "content", "") or ""
-                if not isinstance(delta, str):
+                # Drenar eventos de tool calls acumulados pelos callbacks ──
+                # Os tool calls acontecem dentro do ainvoke do _wrap; chegam
+                # aqui depois de o nó ter terminado, antes de processar o texto.
+                for ev in _drain_tool_queue():
+                    yield _sse(ev)
+
+                # ── Extrair texto do chunk (AIMessage / AIMessageChunk) ──────
+                raw = getattr(chunk, "content", "") or ""
+                if not isinstance(raw, str):
                     try:
+                        # Filtra blocos "thinking" do Gemini
                         delta = "".join(
-                            p.get("text", "") for p in delta if isinstance(p, dict)
+                            p.get("text", "")
+                            for p in raw
+                            if isinstance(p, dict) and p.get("type") != "thinking"
                         )
                     except Exception:
-                        delta = str(delta)
+                        delta = ""
+                else:
+                    delta = raw
 
                 if delta:
-                    payload = json.dumps({"delta": delta}, ensure_ascii=False)
-                    yield f"data: {payload}\n\n".encode("utf-8")
+                    if current_msg_id is None:
+                        current_msg_id = str(uuid.uuid4())
+                        yield _sse({
+                            "type": "TEXT_MESSAGE_START",
+                            "messageId": current_msg_id,
+                            "role": "assistant",
+                        })
+                    yield _sse({
+                        "type": "TEXT_MESSAGE_DELTA",
+                        "messageId": current_msg_id,
+                        "delta": delta,
+                    })
 
-            yield b"data: [DONE]\n\n"
+            # Fim do stream: fechar mensagem aberta + drenar fila restante ─
+            for ev in _drain_tool_queue():
+                yield _sse(ev)
+
+            if current_msg_id:
+                yield _sse({"type": "TEXT_MESSAGE_END", "messageId": current_msg_id})
+
+            yield _sse({"type": "RUN_FINISHED", "runId": run_id, "threadId": body.conversationId})
+
         except asyncio.CancelledError:
-            # cliente desconectou
             raise
         except Exception as exc:  # noqa: BLE001
-            err = json.dumps({"error": str(exc)}, ensure_ascii=False)
-            yield f"data: {err}\n\n".encode("utf-8")
-            yield b"data: [DONE]\n\n"
+            for ev in _drain_tool_queue():
+                yield _sse(ev)
+            if current_msg_id:
+                yield _sse({"type": "TEXT_MESSAGE_END", "messageId": current_msg_id})
+            yield _sse({"type": "RUN_ERROR", "runId": run_id, "message": str(exc)})
         finally:
+            _tool_event_queue.reset(ctx_token)
             print(turn_summary())
 
     return StreamingResponse(

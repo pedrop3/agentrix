@@ -14,7 +14,6 @@ Estrategia:
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.prebuilt import create_react_agent
 from langchain_ollama import ChatOllama
-from langchain.agents import create_agent
 from config import config
 from logger import LLMLogger
 
