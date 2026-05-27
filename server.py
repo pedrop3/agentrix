@@ -23,6 +23,17 @@ from config import config
 from graph import build_direct, build_graph, build_supervisor
 from logger import reset_steps, turn_summary
 
+# ─── LangSmith tracing ────────────────────────────────────────────────────────
+if config.langsmith.enabled and config.langsmith.api_key:
+    import os
+    os.environ.setdefault("LANGSMITH_TRACING",  "true")
+    os.environ.setdefault("LANGSMITH_API_KEY",   config.langsmith.api_key)
+    os.environ.setdefault("LANGSMITH_PROJECT",   config.langsmith.project)
+    os.environ.setdefault("LANGSMITH_ENDPOINT",  config.langsmith.endpoint)
+    print(f"[langsmith] Tracing activo → projecto '{config.langsmith.project}'")
+else:
+    print("[langsmith] Tracing desactivado (LANGSMITH_TRACING=false ou sem API key)")
+
 # Estado global compartilhado entre requests
 runtime: dict = {}
 
@@ -118,10 +129,19 @@ def _build_user_message(body: ChatBody) -> HumanMessage:
 
 
 def _config_for(body: ChatBody) -> dict:
-    return {
+    cfg: dict = {
         "configurable": {"thread_id": body.conversationId},
         "recursion_limit": config.recursion_limit,
     }
+    # Metadados visíveis no LangSmith UI por cada run
+    if config.langsmith.enabled and config.langsmith.api_key:
+        cfg["run_name"] = f"turn/{body.conversationId[:8]}"
+        cfg["tags"]     = ["agentrix", config.web.domain]
+        cfg["metadata"] = {
+            "conversation_id": body.conversationId,
+            "domain":          config.web.domain,
+        }
+    return cfg
 
 
 
