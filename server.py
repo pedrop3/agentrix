@@ -16,7 +16,9 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import BaseModel
 
-from agents.knower import build_knower
+from agents.compare_agent import build_compare_agent
+from agents.faq_agent import build_faq_agent
+from agents.web_agent import build_web_agent
 from logger import _tool_event_queue
 from agents.mathy import build_mathy
 from agents.researcher import build_researcher
@@ -61,15 +63,18 @@ async def lifespan(app: FastAPI):
     researcher = build_researcher(tools, config.ollama.researcher_model)
     writer = build_writer(tools, config.ollama.writer_model)
     mathy = build_mathy(tools, config.ollama.mathy_model)
-    knower = build_knower(tools, config.ollama.knower_model)
+    faq = build_faq_agent(tools)
+    compare = build_compare_agent(tools)
+    web = build_web_agent(tools)
     supervisor = build_supervisor(config.ollama.supervisor_model)
     direct = build_direct(config.ollama.direct_model)
 
     async with AsyncSqliteSaver.from_conn_string(config.memory_db) as checkpointer:
-        graph = build_graph(researcher, writer, mathy, supervisor, direct, knower, checkpointer)
+        graph = build_graph(researcher, writer, mathy, supervisor, direct, faq, compare, web, checkpointer)
         runtime["graph"] = graph
         runtime["mcp"] = client
-        print("[server] Pronto. Endpoints: /chat /chat/stream /upload /health")
+        print("[server] Pronto. Agentes: faq · compare · web · researcher · writer · mathy · direct")
+        print("[server] Endpoints: /chat /chat/stream /chat/resume /upload /health")
         try:
             yield
         finally:
@@ -108,6 +113,11 @@ class ChatBody(BaseModel):
     conversationId: str
     messages: list[ChatMessage]
     attachments: Optional[list[Attachment]] = None
+
+
+class ResumeBody(BaseModel):
+    conversationId: str
+    value: str  # label of the option selected by the user
 
 
 def _get_graph():
@@ -176,109 +186,161 @@ async def chat(body: ChatBody):
         print(turn_summary())
 
 
+def _streaming_response(generator: AsyncIterator[bytes]) -> StreamingResponse:
+    """Wrap an async bytes generator into a StreamingResponse with SSE headers."""
+    return StreamingResponse(
+        generator,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+async def _run_graph_stream(
+    graph,
+    graph_input,
+    run_config: dict,
+    conversation_id: str,
+    request: Optional[Request] = None,
+):
+    """Shared SSE generator for both /chat/stream and /chat/resume.
+
+    Streams AG-UI events from a LangGraph run. After the astream loop ends,
+    checks the graph state for a pending interrupt and emits an INTERRUPT event
+    so the frontend can render interactive option cards.
+    """
+    run_id = str(uuid.uuid4())
+    current_msg_id: str | None = None
+
+    tool_q: asyncio.Queue = asyncio.Queue()
+    ctx_token = _tool_event_queue.set(tool_q)
+
+    def _drain_tool_queue():
+        events = []
+        while not tool_q.empty():
+            events.append(tool_q.get_nowait())
+        return events
+
+    yield _sse({"type": "RUN_STARTED", "runId": run_id, "threadId": conversation_id})
+
+    try:
+        async for chunk, metadata in graph.astream(
+            graph_input,
+            config=run_config,
+            stream_mode="messages",
+        ):
+            if request and await request.is_disconnected():
+                break
+
+            node = (metadata or {}).get("langgraph_node")
+            if node in ("supervisor", "clarify"):
+                continue
+
+            # Always flush tool events before any text check so rag_search
+            # badges (from faq_agent) appear even when we suppress the text.
+            for ev in _drain_tool_queue():
+                yield _sse(ev)
+
+            # Suppress FAQ_MISS routing signals — internal signal from faq_agent
+            # that the cache was empty. The supervisor re-routes to web_agent;
+            # the user should never see this intermediate "FAQ_MISS: ..." text.
+            raw_preview = getattr(chunk, "content", "") or ""
+            if isinstance(raw_preview, str) and raw_preview.startswith("FAQ_MISS"):
+                continue
+
+            raw = getattr(chunk, "content", "") or ""
+            if not isinstance(raw, str):
+                try:
+                    delta = "".join(
+                        p.get("text", "")
+                        for p in raw
+                        if isinstance(p, dict) and p.get("type") != "thinking"
+                    )
+                except Exception:
+                    delta = ""
+            else:
+                delta = raw
+
+            if delta:
+                if current_msg_id is None:
+                    current_msg_id = str(uuid.uuid4())
+                    yield _sse({
+                        "type": "TEXT_MESSAGE_START",
+                        "messageId": current_msg_id,
+                        "role": "assistant",
+                    })
+                yield _sse({
+                    "type": "TEXT_MESSAGE_DELTA",
+                    "messageId": current_msg_id,
+                    "delta": delta,
+                })
+
+        for ev in _drain_tool_queue():
+            yield _sse(ev)
+
+        if current_msg_id:
+            yield _sse({"type": "TEXT_MESSAGE_END", "messageId": current_msg_id})
+
+        # ── Check for pending interrupt (e.g. clarify node paused the graph) ──
+        try:
+            state = await graph.aget_state(run_config)
+            all_interrupts = [
+                intr.value
+                for task in (state.tasks or [])
+                for intr in (getattr(task, "interrupts", None) or [])
+            ]
+            if all_interrupts:
+                intr_val = all_interrupts[0]
+                print(f"[server] interrupt detected: {intr_val}")
+                yield _sse({"type": "INTERRUPT", **intr_val})
+        except Exception as exc:  # noqa: BLE001
+            print(f"[server] aget_state error: {exc}")
+
+        yield _sse({"type": "RUN_FINISHED", "runId": run_id, "threadId": conversation_id})
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        for ev in _drain_tool_queue():
+            yield _sse(ev)
+        if current_msg_id:
+            yield _sse({"type": "TEXT_MESSAGE_END", "messageId": current_msg_id})
+        yield _sse({"type": "RUN_ERROR", "runId": run_id, "message": str(exc)})
+    finally:
+        _tool_event_queue.reset(ctx_token)
+        print(turn_summary())
+
+
 @app.post("/chat/stream")
 async def chat_stream(body: ChatBody, request: Request):
     graph = _get_graph()
     reset_steps()
-    run_config = _config_for(body)  # nao usar `config` (shadow do modulo)
+    run_config = _config_for(body)
     user_msg = _build_user_message(body)
 
-    async def event_source() -> AsyncIterator[bytes]:
-        run_id = str(uuid.uuid4())
-        current_msg_id: str | None = None
+    return _streaming_response(
+        _run_graph_stream(graph, {"messages": [user_msg]}, run_config, body.conversationId, request)
+    )
 
-        # Fila de eventos de tool calls populada pelos callbacks LLMLogger/ToolOnlyLogger.
-        # Necessário porque _wrap usa ainvoke — os tool calls do knower são invisíveis
-        # ao stream do grafo pai; apenas os callbacks conseguem interceptá.
-        tool_q: asyncio.Queue = asyncio.Queue()
-        ctx_token = _tool_event_queue.set(tool_q)
 
-        def _drain_tool_queue():
-            """Yield all pending tool events from the queue (non-blocking)."""
-            events = []
-            while not tool_q.empty():
-                events.append(tool_q.get_nowait())
-            return events
+@app.post("/chat/resume")
+async def chat_resume(body: ResumeBody, request: Request):
+    """Resume a graph that was paused at an interrupt (e.g. clarify node).
 
-        yield _sse({"type": "RUN_STARTED", "runId": run_id, "threadId": body.conversationId})
+    The frontend sends the value selected by the user; we pass it to the graph
+    via Command(resume=value) so the clarify_node can receive it and continue.
+    """
+    from langgraph.types import Command
 
-        try:
-            async for chunk, metadata in graph.astream(
-                {"messages": [user_msg]},
-                config=run_config,
-                stream_mode="messages",
-            ):
-                if await request.is_disconnected():
-                    break
+    graph = _get_graph()
+    reset_steps()
+    run_config = _config_for(body)
 
-                node = (metadata or {}).get("langgraph_node")
-                if node == "supervisor":
-                    continue
-
-                # Drenar eventos de tool calls acumulados pelos callbacks ──
-                # Os tool calls acontecem dentro do ainvoke do _wrap; chegam
-                # aqui depois de o nó ter terminado, antes de processar o texto.
-                for ev in _drain_tool_queue():
-                    yield _sse(ev)
-
-                # ── Extrair texto do chunk (AIMessage / AIMessageChunk) ──────
-                raw = getattr(chunk, "content", "") or ""
-                if not isinstance(raw, str):
-                    try:
-                        # Filtra blocos "thinking" do Gemini
-                        delta = "".join(
-                            p.get("text", "")
-                            for p in raw
-                            if isinstance(p, dict) and p.get("type") != "thinking"
-                        )
-                    except Exception:
-                        delta = ""
-                else:
-                    delta = raw
-
-                if delta:
-                    if current_msg_id is None:
-                        current_msg_id = str(uuid.uuid4())
-                        yield _sse({
-                            "type": "TEXT_MESSAGE_START",
-                            "messageId": current_msg_id,
-                            "role": "assistant",
-                        })
-                    yield _sse({
-                        "type": "TEXT_MESSAGE_DELTA",
-                        "messageId": current_msg_id,
-                        "delta": delta,
-                    })
-
-            # Fim do stream: fechar mensagem aberta + drenar fila restante ─
-            for ev in _drain_tool_queue():
-                yield _sse(ev)
-
-            if current_msg_id:
-                yield _sse({"type": "TEXT_MESSAGE_END", "messageId": current_msg_id})
-
-            yield _sse({"type": "RUN_FINISHED", "runId": run_id, "threadId": body.conversationId})
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            for ev in _drain_tool_queue():
-                yield _sse(ev)
-            if current_msg_id:
-                yield _sse({"type": "TEXT_MESSAGE_END", "messageId": current_msg_id})
-            yield _sse({"type": "RUN_ERROR", "runId": run_id, "message": str(exc)})
-        finally:
-            _tool_event_queue.reset(ctx_token)
-            print(turn_summary())
-
-    return StreamingResponse(
-        event_source(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",  # desabilita buffering em nginx
-            "Connection": "keep-alive",
-        },
+    return _streaming_response(
+        _run_graph_stream(graph, Command(resume=body.value), run_config, body.conversationId, request)
     )
 
 

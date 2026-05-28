@@ -502,5 +502,95 @@ def kg_neighbors(name: str) -> str:
     return "\n".join(lines) if len(lines) > 1 else f"{header}\n  (no outgoing relations)"
 
 
+# ─── compare_products ─────────────────────────────────────────────────────────
+@mcp.tool(
+    title="Compare Products (Knowledge Graph)",
+    description=(
+        "Compare 2 or more products side by side using the Knowledge Graph. "
+        "Pass a comma-separated list of product name substrings (case-insensitive). "
+        "For each matching Product entity the tool returns its fees, requirements, "
+        "benefits, channels, and target segments from the KG. "
+        "Best used for questions like: 'diferença entre Cartão Gold e Cartão Black', "
+        "'quais são as taxas de cada conta', 'comparar X com Y'. "
+        "Returns an empty/sparse result when the KG has not been populated yet — "
+        "in that case fall back to rag_search."
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+def compare_products(product_names: str) -> str:
+    """Compare KG attributes for the listed products (comma-separated names)."""
+    from collections import defaultdict
+    from rag import get_rag
+
+    names = [n.strip() for n in product_names.split(",") if n.strip()]
+    if not names:
+        return "Provide at least one product name (comma-separated)."
+
+    rag = get_rag()
+    with rag.driver.session(database=rag.database) as s:
+        res = s.run(
+            """
+            MATCH (p:Product)
+            WHERE any(qname IN $names WHERE toLower(p.name) CONTAINS toLower(qname))
+            OPTIONAL MATCH (p)-[r]->(n)
+            WHERE type(r) IN ['HAS_FEE','REQUIRES','OFFERS','AVAILABLE_IN','FOR_SEGMENT']
+            RETURN p.name          AS product,
+                   type(r)         AS rel_type,
+                   n.name          AS attribute
+            ORDER BY p.name, type(r), n.name
+            """,
+            names=names,
+        )
+        rows = list(res)
+
+    # Collect product names even when they have no outgoing relations
+    found: set[str] = set()
+    data: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+
+    for row in rows:
+        p = row["product"]
+        if p:
+            found.add(p)
+        if row["rel_type"] and row["attribute"] and p:
+            # Human-readable relationship label
+            label = {
+                "HAS_FEE":      "Fees",
+                "REQUIRES":     "Requirements",
+                "OFFERS":       "Benefits",
+                "AVAILABLE_IN": "Channels",
+                "FOR_SEGMENT":  "Target segment",
+            }.get(row["rel_type"], row["rel_type"])
+            data[p][label].append(row["attribute"])
+
+    if not found:
+        return (
+            f"No Product entities matching {product_names!r} found in the knowledge graph. "
+            "The graph may not have been populated yet — try rag_search or web_search instead."
+        )
+
+    # Determine all attribute categories present across all products
+    all_labels = ["Fees", "Requirements", "Benefits", "Channels", "Target segment"]
+
+    lines = [f"# Product comparison: {' | '.join(sorted(found))}", ""]
+
+    for prod in sorted(found):
+        lines.append(f"## {prod}")
+        attrs = data[prod]
+        if not attrs:
+            lines.append("  (no attributes in knowledge graph yet)")
+        else:
+            for lbl in all_labels:
+                vals = attrs.get(lbl)
+                if vals:
+                    lines.append(f"  **{lbl}**: {' · '.join(vals)}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
