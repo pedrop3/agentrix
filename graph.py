@@ -51,12 +51,14 @@ class RouterDecision(BaseModel):
     next: Literal[
         "researcher", "writer", "mathy",
         "faq", "compare", "web",
-        "direct", "clarify", "END"
+        "direct", "clarify", "out_of_scope", "END"
     ] = Field(
         description=(
             "Which agent should act next, or END if the task is complete. "
             "Use 'clarify' only when the user asks about a product without specifying "
-            "which variant (e.g. 'o cartão' when Gold/Black/Standard all exist)."
+            "which variant (e.g. 'o cartão' when Gold/Black/Standard all exist). "
+            "Use 'out_of_scope' when the question has absolutely nothing to do with "
+            "the domain (banking/finance)"
         )
     )
     reason: str = Field(description="Brief reason for the decision (one sentence).")
@@ -74,7 +76,16 @@ def _supervisor_prompt() -> str:
     """Prompt do supervisor com dominio/nome de exibicao vindos do config."""
     web = config.web
     return f"""/no_think
-You are a supervisor routing user requests to specialized agents.
+You are a supervisor routing user requests to specialized agents for {web.display_name}, a financial services assistant.
+
+## In-scope topics
+Banking, finance, and {web.display_name} products: accounts, cards, loans, investments, insurance, fees,
+transfers, payments, exchange rates, interest rates. Also: saving notes, math calculations, greetings,
+follow-up questions about a previous answer, and clarification requests.
+
+## Out-of-scope topics (examples)
+Programming, technology, science, history, sports, entertainment, cooking, health (non-financial),
+geography, general knowledge — anything with NO connection to banking, finance, or {web.display_name}.
 
 Available agents:
 - "researcher": searches the user's own saved notes (writer-created)
@@ -91,25 +102,38 @@ Available agents:
 - "web":        fetches fresh content from {web.domain} web.
                 Route here when faq returned "FAQ_MISS:", or when live data is needed,
                 or for general {web.display_name} questions that are NOT comparisons.
-- "direct":     conversational/contextual — NO math, NO {web.display_name} knowledge.
-- "clarify":    ask the user to disambiguate ONLY when a {web.display_name} product/service
-                variant is truly unclear (e.g. "o cartão" when Gold/Standard/Black all exist).
+- "direct":     conversational/contextual — greetings, follow-ups, clarifications.
+                NO math, NO {web.display_name} product knowledge.
+- "clarify":    ask the user to disambiguate when a {web.display_name} product/service
+                is ambiguous at the TYPE level OR the VARIANT level:
+                  • TYPE unclear  → "cartão" (credit? debit? prepaid?),
+                                    "conta" (à ordem? poupança? jovem?),
+                                    "seguro" (vida? automóvel? habitação?)
+                  • VARIANT unclear → "cartão de crédito" (Standard? Gold? Platinum?)
                 → set clarification_question + clarification_options (2-4 items).
-                Do NOT use clarify for general questions — route those to "direct".
+                Do NOT clarify if the user already named a specific product.
+- "out_of_scope": the question has NO connection to banking, finance, or {web.display_name}.
+                  Use this when the topic is completely outside the domain defined above.
+                  Do NOT use for vague questions — give them the benefit of the doubt.
 
 Decision rules (in order):
 1. ANY arithmetic or numbers to compute → "mathy" (MANDATORY, even trivial like "2+2")
 2. SAVE / CREATE / WRITE a note → "writer"
 3. FIND something previously saved → "researcher"
-4. Comparison between 2+ {web.display_name} products → "compare"
-5. Single {web.display_name} product/FAQ question → "faq" first
+4. Topic is clearly outside banking/finance (e.g. "what is OOP in Java",
+   "who won the World Cup", "recipe for pasta") → "out_of_scope"
+5. Product TYPE is ambiguous (e.g. "cartão", "conta", "seguro" without type) → "clarify"
+6. Comparison between 2+ {web.display_name} products → "compare"
+7. Single {web.display_name} product/FAQ question → "faq" first
    - If last agent was "faq" AND its reply starts with "FAQ_MISS:" → "web"
    - If last agent was "faq" AND it provided a real answer → END
-6. General {web.display_name} question (not a comparison, not a single product FAQ) → "web"
-7. Conversational / greeting / no-domain content → "direct"
-8. Previous terminal agent already completed the task → END
+8. Product VARIANT is ambiguous (e.g. "cartão de crédito" without Gold/Standard/Platinum) → "clarify"
+9. General {web.display_name} question (not a comparison, not a single product FAQ) → "web"
+10. Conversational / greeting / follow-up → "direct"
+11. Previous terminal agent already completed the task → END
 
 CRITICAL: NEVER send math to "direct", "faq", "compare", or "web".
+CRITICAL: When in doubt about scope, prefer "direct" over "out_of_scope".
 
 You MUST return valid JSON:
 {{"next": "...", "reason": "...", "clarification_question": null, "clarification_options": null}}
@@ -117,7 +141,7 @@ When next=clarify, fill clarification_question and clarification_options.
 """
 
 
-# mantido por compat — modulos que importam SUPERVISOR_PROMPT continuam funcionando
+
 SUPERVISOR_PROMPT = _supervisor_prompt()
 
 DIRECT_PROMPT = """
@@ -167,6 +191,14 @@ class SupervisorState(MessagesState):
     # Set by supervisor_node when routing to clarify; read by clarify_node.
     clarify_question: Optional[str]
     clarify_options: Optional[list]
+
+
+OUT_OF_SCOPE_MSG = (
+    "Desculpe, sou um assistente especializado em serviços financeiros "
+    "e não consigo ajudar com esse tema. "
+    "Posso responder perguntas sobre contas, cartões, créditos, investimentos "
+    "e outros produtos financeiros. Em que posso ajudar?"
+)
 
 
 def build_graph(researcher, writer, mathy, supervisor, direct, faq, compare, web, checkpointer=None):
@@ -241,7 +273,20 @@ def build_graph(researcher, writer, mathy, supervisor, direct, faq, compare, web
         history = state["messages"][-DIRECT_HISTORY_LIMIT:]
         messages = _inject_no_think([SystemMessage(content=DIRECT_PROMPT), *history])
         response = await direct.ainvoke(messages)
-        return {"messages": [AIMessage(content=response.content, name="direct")]}
+
+        # Flatten Gemini list-content to plain string.
+        content = response.content
+        if isinstance(content, list):
+            content = "".join(
+                b.get("text", "") if isinstance(b, dict) else str(b) for b in content
+            )
+
+        # IMPORTANT: preserve the original message ID so LangGraph recognises this
+        # as the same message that was already streamed token-by-token during ainvoke.
+        # Creating a new AIMessage (new ID) causes LangGraph to emit it a second time
+        # → the full text appears duplicated in the client.
+        out = response.model_copy(update={"content": content, "name": "direct"})
+        return {"messages": [out]}
 
     def _wrap(sub_agent, name: str, isolate: bool = False):
         """Wrap a sub-agent as a graph node.
@@ -284,10 +329,18 @@ def build_graph(researcher, writer, mathy, supervisor, direct, faq, compare, web
 
         return node
 
+    def out_of_scope_node(state: SupervisorState):
+        """Resposta fixa para perguntas fora do domínio bancário/financeiro."""
+        print("[out_of_scope] pergunta fora do domínio — resposta canned")
+        return {
+            "messages": [AIMessage(content=OUT_OF_SCOPE_MSG, name="direct")],
+        }
+
     workflow = StateGraph(SupervisorState)
     workflow.add_node("supervisor", supervisor_node)
     workflow.add_node("direct", direct_node)
     workflow.add_node("clarify", clarify_node)
+    workflow.add_node("out_of_scope", out_of_scope_node)
     workflow.add_node("researcher", _wrap(researcher, "researcher"))
     workflow.add_node("writer", _wrap(writer, "writer"))
     workflow.add_node("mathy", _wrap(mathy, "mathy"))
@@ -301,19 +354,21 @@ def build_graph(researcher, writer, mathy, supervisor, direct, faq, compare, web
         "supervisor",
         lambda s: s["next"],
         {
-            "researcher": "researcher",
-            "writer":     "writer",
-            "mathy":      "mathy",
-            "faq":        "faq",
-            "compare":    "compare",
-            "web":        "web",
-            "direct":     "direct",
-            "clarify":    "clarify",
-            "END":        END,
+            "researcher":    "researcher",
+            "writer":        "writer",
+            "mathy":         "mathy",
+            "faq":           "faq",
+            "compare":       "compare",
+            "web":           "web",
+            "direct":        "direct",
+            "clarify":       "clarify",
+            "out_of_scope":  "out_of_scope",
+            "END":           END,
         },
     )
     # All agents loop back to supervisor; supervisor decides END or next agent.
-    for node in ("direct", "clarify", "researcher", "writer", "mathy",
+    # out_of_scope uses name="direct" so supervisor short-circuits to END.
+    for node in ("direct", "clarify", "out_of_scope", "researcher", "writer", "mathy",
                  "faq", "compare", "web"):
         workflow.add_edge(node, "supervisor")
 

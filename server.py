@@ -190,7 +190,30 @@ async def chat(body: ChatBody):
             config=_config_for(body),
         )
         last = result["messages"][-1]
-        return {"reply": last.content}
+
+        content = last.content
+        if isinstance(content, list):
+            content = "".join(
+                b.get("text", "") if isinstance(b, dict) else str(b)
+                for b in content
+            )
+        # If the graph paused at a clarify interrupt, the last message is still
+        # the user HumanMessage (no AI reply yet). Detect and surface the question.
+        from langchain_core.messages import HumanMessage as _HumanMessage
+        if isinstance(last, _HumanMessage):
+            state = await graph.aget_state(_config_for(body))
+            interrupts = [
+                intr.value
+                for task in (state.tasks or [])
+                for intr in (getattr(task, "interrupts", None) or [])
+            ]
+            if interrupts:
+                intr = interrupts[0]
+                opts = ", ".join(o["label"] for o in (intr.get("options") or []))
+                content = f"{intr.get('question', 'Por favor, seja mais específico.')} ({opts})"
+            else:
+                content = ""
+        return {"reply": content}
     finally:
         print(turn_summary())
 
