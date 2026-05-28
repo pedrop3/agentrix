@@ -83,6 +83,7 @@ class Hit:
     source: str
     kind: str
     score: float
+    id: str = ""  # chunk node id — populated by hybrid_search / search
 
     def to_block(self) -> str:
         return f"[{self.kind} · {self.source} · score={self.score:.3f}]\n{self.text}"
@@ -188,6 +189,21 @@ class RAG:
                 }}
                 """
             )
+            # Feedback node constraint
+            s.run(
+                "CREATE CONSTRAINT feedback_id IF NOT EXISTS "
+                "FOR (f:Feedback) REQUIRE f.id IS UNIQUE"
+            )
+            # Ensure Chunk nodes have feedback counters (best-effort; existing
+            # chunks get the defaults lazily on first update)
+            s.run(
+                """
+                MATCH (c:Chunk)
+                WHERE c.feedback_positive IS NULL
+                SET c.feedback_positive = 0, c.feedback_negative = 0
+                """
+            )
+
             # Fulltext (Lucene) index sobre o texto do chunk — usado pelo
             # hybrid_search pra combinar com a similaridade semantica.
             # Analyzer 'portuguese' faz stemming PT, normaliza acentos e
@@ -300,6 +316,7 @@ class RAG:
                 RETURN c.text AS text,
                        c.source AS source,
                        c.kind AS kind,
+                       c.id AS id,
                        score
                 ORDER BY score DESC
                 LIMIT $k
@@ -312,7 +329,13 @@ class RAG:
                 excluded=excluded,
             )
             return [
-                Hit(text=r["text"], source=r["source"], kind=r["kind"], score=float(r["score"]))
+                Hit(
+                    text=r["text"],
+                    source=r["source"],
+                    kind=r["kind"],
+                    score=float(r["score"]),
+                    id=r["id"] or "",
+                )
                 for r in res
             ]
 
@@ -449,9 +472,130 @@ class RAG:
                     source=meta["source"],
                     kind=meta["kind"],
                     score=normalized,
+                    id=cid,
                 )
             )
         return hits
+
+    def save_feedback(
+        self,
+        *,
+        feedback_id: str,
+        conversation_id: str,
+        message_id: str,
+        question: str,
+        answer: str,
+        vote: str,          # "up" | "down"
+        chunk_ids: list[str],
+    ) -> None:
+        """Persiste um :Feedback node e liga-o aos chunks usados.
+
+        Cria :Feedback com campos básicos e relacionamentos USED_CHUNK
+        para cada chunk que foi usado na resposta (aproximado via rag_search
+        re-run na questão). Também incrementa os contadores no próprio Chunk.
+        """
+        import datetime
+
+        with self._driver.session(database=self._db) as s:
+
+            s.run(
+                """
+                MERGE (f:Feedback {id: $fid})
+                SET f.conversation_id = $conv,
+                    f.message_id      = $msg,
+                    f.question        = $question,
+                    f.answer          = $answer,
+                    f.vote            = $vote,
+                    f.created_at      = $ts
+                """,
+                fid=feedback_id,
+                conv=conversation_id,
+                msg=message_id,
+                question=question,
+                answer=answer,
+                vote=vote,
+                ts=datetime.datetime.utcnow().isoformat(),
+            )
+            # 2) Liga Feedback -> Chunk (USED_CHUNK)
+            if chunk_ids:
+                s.run(
+                    """
+                    MATCH (f:Feedback {id: $fid})
+                    UNWIND $ids AS cid
+                    MATCH (c:Chunk {id: cid})
+                    MERGE (f)-[:USED_CHUNK]->(c)
+                    """,
+                    fid=feedback_id,
+                    ids=chunk_ids,
+                )
+            # 3) Incrementa contadores nos chunks
+            self.increment_chunk_feedback(chunk_ids, positive=(vote == "up"))
+
+    def increment_chunk_feedback(self, chunk_ids: list[str], positive: bool) -> int:
+        """Incrementa feedback_positive ou feedback_negative nos Chunk nodes.
+
+
+        """
+        if not chunk_ids:
+            return 0
+        field = "feedback_positive" if positive else "feedback_negative"
+        with self._driver.session(database=self._db) as s:
+            r = s.run(
+                f"""
+                UNWIND $ids AS cid
+                MATCH (c:Chunk {{id: cid}})
+                SET c.{field} = coalesce(c.{field}, 0) + 1
+                RETURN count(c) AS updated
+                """,
+                ids=chunk_ids,
+            ).single()
+            return int(r["updated"]) if r else 0
+
+    def feedback_stats(self) -> dict:
+        """Agrega estatísticas de feedback por kind e vote."""
+        with self._driver.session(database=self._db) as s:
+            rows = list(
+                s.run(
+                    """
+                    MATCH (f:Feedback)
+                    RETURN f.vote AS vote, count(f) AS n
+                    ORDER BY vote
+                    """
+                )
+            )
+            total_up = sum(r["n"] for r in rows if r["vote"] == "up")
+            total_down = sum(r["n"] for r in rows if r["vote"] == "down")
+
+            top_positive = list(
+                s.run(
+                    """
+                    MATCH (c:Chunk)
+                    WHERE coalesce(c.feedback_positive, 0) > 0
+                    RETURN c.id AS id, c.source AS source, c.kind AS kind,
+                           c.feedback_positive AS pos, c.feedback_negative AS neg
+                    ORDER BY pos DESC
+                    LIMIT 10
+                    """
+                )
+            )
+            top_negative = list(
+                s.run(
+                    """
+                    MATCH (c:Chunk)
+                    WHERE coalesce(c.feedback_negative, 0) > 0
+                    RETURN c.id AS id, c.source AS source, c.kind AS kind,
+                           c.feedback_positive AS pos, c.feedback_negative AS neg
+                    ORDER BY neg DESC
+                    LIMIT 10
+                    """
+                )
+            )
+        return {
+            "total_up": total_up,
+            "total_down": total_down,
+            "top_positive_chunks": [dict(r) for r in top_positive],
+            "top_negative_chunks": [dict(r) for r in top_negative],
+        }
 
     # -----------------------------------------------------------------------
     # Busca semantica + expansão de grafo (1 hop)
