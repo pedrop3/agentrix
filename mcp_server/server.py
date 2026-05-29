@@ -592,5 +592,55 @@ def compare_products(product_names: str) -> str:
     return "\n".join(lines).rstrip()
 
 
+@mcp.tool(
+    title="Remember User Fact",
+    description=(
+        "Persist a fact about the current user to long-term memory so it is available "
+        "in future conversations. Use this whenever the user shares personal information "
+        "such as their name, preferences, goals, or any detail they would expect to be "
+        "remembered next time.\n\n"
+        "Examples:\n"
+        "  remember_fact(user_id='...', key='name', value='Carlos')\n"
+        "  remember_fact(user_id='...', key='preferred_language', value='Portuguese')\n"
+        "  remember_fact(user_id='...', key='main_account', value='Conta Mundo 123')\n\n"
+        "key  : short snake_case label (e.g. 'name', 'city', 'card_preference')\n"
+        "value: the fact as a short string"
+    ),
+    annotations=ToolAnnotations(read_only_hint=False),
+)
+def remember_fact(user_id: str, key: str, value: str) -> str:
+    """Save a single key/value fact to the user's long-term profile."""
+    if not user_id or not key or not value:
+        return "Error: user_id, key and value are all required."
+    try:
+        from memory import get_memory
+        get_memory().save_fact(user_id, key.strip().lower().replace(" ", "_"), value.strip())
+        return f"Remembered: {key} = {value}"
+    except Exception as e:
+        return f"Error saving fact: {e}"
+
+
+@mcp.tool(
+    title="Recall User Facts",
+    description=(
+        "Retrieve all facts previously remembered for a user. "
+        "Use this to check what is already known before asking the user to repeat themselves."
+    ),
+    annotations=ToolAnnotations(read_only_hint=True),
+)
+def recall_facts(user_id: str) -> str:
+    """Load all stored facts for a user."""
+    if not user_id:
+        return "Error: user_id is required."
+    try:
+        from memory import get_memory
+        facts = get_memory().load_facts(user_id)
+        if not facts:
+            return "No facts stored for this user yet."
+        return "\n".join(f"{k}: {v}" for k, v in facts.items())
+    except Exception as e:
+        return f"Error reading facts: {e}"
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")

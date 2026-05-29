@@ -111,6 +111,7 @@ class Attachment(BaseModel):
 
 class ChatBody(BaseModel):
     conversationId: str
+    userId: Optional[str] = None        # stable cross-conversation user identifier
     messages: list[ChatMessage]
     attachments: Optional[list[Attachment]] = None
 
@@ -129,6 +130,28 @@ class FeedbackBody(BaseModel):
     vote: str                # "up" | "down"
 
 
+# ─── Padrões simples de factos pessoais (sem LLM extra) ──────────────────────
+import re as _re
+
+_FACT_PATTERNS: list[tuple[str, str, _re.Pattern]] = [
+    # (key, description, pattern)
+    ("name",     "nome",       _re.compile(r"(?:meu nome é|chamo-me|sou o|sou a)\s+([A-ZÀ-Ü][a-zà-ü]+(?:\s+[A-ZÀ-Ü][a-zà-ü]+)*)", _re.IGNORECASE)),
+    ("city",     "cidade",     _re.compile(r"(?:moro em|vivo em|sou de|resido em)\s+([A-ZÀ-Ü][a-zà-ü]+(?:\s+[A-ZÀ-Ü][a-zà-ü]+)*)", _re.IGNORECASE)),
+    ("job",      "profissão",  _re.compile(r"(?:sou|trabalho como)\s+((?:um |uma )?[a-zà-ü]+(?:\s+[a-zà-ü]+)?)", _re.IGNORECASE)),
+]
+
+
+def _auto_extract_facts(user_id: str, text: str, mem) -> None:
+    """Extract personal facts from user message using regex patterns and save them."""
+    for key, _desc, pattern in _FACT_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            value = m.group(1).strip()
+            if value:
+                mem.save_fact(user_id, key, value)
+                print(f"[memory] auto-saved: {key}={value!r} for user {user_id[:8]}")
+
+
 def _get_graph():
     g = runtime.get("graph")
     if g is None:
@@ -138,15 +161,31 @@ def _get_graph():
 
 def _build_user_message(body: ChatBody) -> HumanMessage:
     """
-    Monta o HumanMessage a partir do payload. O qwen2.5 nao e multimodal,
-    entao por ora apenas adicionamos uma nota com os nomes dos anexos.
+    Monta o HumanMessage a partir do payload.
+    Se userId presente, injeta os factos do perfil do utilizador como contexto
+    para que o direct_node e os agentes tenham acesso à memória de longo prazo.
     """
     last_text = body.messages[-1].content if body.messages else ""
     if body.attachments:
         names = ", ".join(a.name for a in body.attachments)
         suffix = f"\n\n[Anexos enviados pelo usuario: {names}]"
         last_text = (last_text + suffix) if last_text else suffix.strip()
-    return HumanMessage(content=last_text)
+
+    # Inject long-term user memory as a prefix if we have a userId
+    if body.userId:
+        try:
+            from memory import get_memory
+            mem = get_memory()
+            # Auto-extract personal facts from the user's message (fire-and-forget)
+            _auto_extract_facts(body.userId, last_text, mem)
+            # Inject known facts as context prefix
+            ctx = mem.as_context(body.userId)
+            if ctx:
+                last_text = f"{ctx}\n\n{last_text}"
+        except Exception as e:
+            print(f"[memory] failed to load user context: {e}")
+
+    return HumanMessage(content=last_text, additional_kwargs={"user_id": body.userId or ""})
 
 
 def _config_for(body: ChatBody) -> dict:
@@ -495,6 +534,42 @@ async def delete_documents_by_kind(kind: str):
         return {"kind": kind, "removed": removed}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"Erro removendo kind={kind}: {e}")
+
+
+@app.get("/memory/{user_id}")
+async def get_memory_facts(user_id: str):
+    """Retorna todos os factos conhecidos de um utilizador."""
+    from memory import get_memory
+    try:
+        return {"user_id": user_id, "facts": get_memory().load_facts(user_id)}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/memory/{user_id}")
+async def save_memory_fact(user_id: str, body: dict):
+    """Guarda ou actualiza um facto do utilizador. Body: {key, value}"""
+    from memory import get_memory
+    key = body.get("key", "").strip()
+    value = body.get("value", "").strip()
+    if not key or not value:
+        raise HTTPException(422, "key and value required")
+    try:
+        get_memory().save_fact(user_id, key, value)
+        return {"ok": True, "user_id": user_id, "key": key, "value": value}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.delete("/memory/{user_id}/{key}")
+async def delete_memory_fact(user_id: str, key: str):
+    """Remove um facto do perfil do utilizador."""
+    from memory import get_memory
+    try:
+        get_memory().delete_fact(user_id, key)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 @app.post("/feedback")
