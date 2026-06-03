@@ -24,3 +24,4 @@ uploads/
 # Volumes do Docker (Neo4j) — gerenciados pelo docker-compose
 neo4j_data/
 neo4j_logs/
+/presentation/

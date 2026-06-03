@@ -175,10 +175,28 @@ class GeminiConfig:
     )
 
 @dataclass(frozen=True)
+class LangSmithConfig:
+
+    enabled: bool = field(
+        default_factory=lambda: _env("LANGSMITH_TRACING", "false").lower() in {"1", "true", "yes"}
+    )
+    api_key: str = field(
+        default_factory=lambda: _env("LANGSMITH_API_KEY", "")
+    )
+    project: str = field(
+        default_factory=lambda: _env("LANGSMITH_PROJECT", "agentrix")
+    )
+    endpoint: str = field(
+        default_factory=lambda: _env("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
+    )
+
+
+@dataclass(frozen=True)
 class AppConfig:
     # LLM providers
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     gemini: GeminiConfig = field(default_factory=GeminiConfig)
+    langsmith: LangSmithConfig = field(default_factory=LangSmithConfig)
 
     # Infra
     neo4j: Neo4jConfig = field(default_factory=Neo4jConfig)

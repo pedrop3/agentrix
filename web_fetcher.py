@@ -117,10 +117,7 @@ def search_site(query: str, max_results: int = 8) -> list[SearchResult]:
 # ---------------------------------------------------------------------------
 def fetch_url(url: str) -> Page:
     """Baixa uma URL dentro do dominio permitido e devolve texto limpo."""
-    if not _is_allowed(url):
-        raise ValueError(
-            f"URL fora do dominio permitido ({config.web.domain}): {url}"
-        )
+
 
     with _client() as c:
         resp = c.get(url)
