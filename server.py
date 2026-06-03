@@ -133,21 +133,77 @@ class FeedbackBody(BaseModel):
 # ─── Padrões simples de factos pessoais (sem LLM extra) ──────────────────────
 import re as _re
 
+# Keywords that indicate crisis/distress — never extract facts from these messages.
+_CRISIS_KEYWORDS = {
+    "matar", "suicídio", "suicidio", "suicidar", "morrer", "não quero viver",
+    "nao quero viver", "quero desaparecer", "acabar com tudo", "tirar a vida",
+    "sem sentido", "não vale a pena", "nao vale a pena",
+}
+
+# Whitelist of recognised profession keywords to prevent false-positives like "pobre".
+_JOB_WHITELIST = {
+    "médico", "médica", "enfermeiro", "enfermeira", "professor", "professora",
+    "engenheiro", "engenheira", "advogado", "advogada", "dentista", "arquiteto",
+    "arquiteta", "economista", "gestor", "gestora", "programador", "programadora",
+    "designer", "analista", "consultor", "consultora", "contabilista", "comerciante",
+    "farmacêutico", "farmacêutica", "psicólogo", "psicóloga", "nutricionista",
+    "fisioterapeuta", "veterinário", "veterinária", "jornalista", "juiz", "juíza",
+}
+
 _FACT_PATTERNS: list[tuple[str, str, _re.Pattern]] = [
-    # (key, description, pattern)
-    ("name",     "nome",       _re.compile(r"(?:meu nome é|chamo-me|sou o|sou a)\s+([A-ZÀ-Ü][a-zà-ü]+(?:\s+[A-ZÀ-Ü][a-zà-ü]+)*)", _re.IGNORECASE)),
-    ("city",     "cidade",     _re.compile(r"(?:moro em|vivo em|sou de|resido em)\s+([A-ZÀ-Ü][a-zà-ü]+(?:\s+[A-ZÀ-Ü][a-zà-ü]+)*)", _re.IGNORECASE)),
-    ("job",      "profissão",  _re.compile(r"(?:sou|trabalho como)\s+((?:um |uma )?[a-zà-ü]+(?:\s+[a-zà-ü]+)?)", _re.IGNORECASE)),
+    # name — only explicit self-identification patterns
+    ("name", "nome",
+     _re.compile(
+         r"(?:meu nome é|chamo-me|sou o|sou a)\s+([A-ZÀ-Ü][a-zà-ü]+(?:\s+[A-ZÀ-Ü][a-zà-ü]+)*)",
+         _re.IGNORECASE,
+     )),
+    # city — only explicit residence patterns
+    ("city", "cidade",
+     _re.compile(
+         r"(?:moro em|vivo em|resido em)\s+([A-ZÀ-Ü][a-zà-ü]+(?:\s+[A-ZÀ-Ü][a-zà-ü]+)*)",
+         _re.IGNORECASE,
+     )),
+    # monthly_income — capture numeric value in euros/month
+    ("monthly_income", "rendimento mensal",
+     _re.compile(
+         r"(?:ganho|recebo|salário de|auferir?)\s+([\d\s.,]+)\s*(?:euros?|€)\s*(?:por\s+m[eê]s|\/m[eê]s|mensais?)?",
+         _re.IGNORECASE,
+     )),
+    # job — only match against known profession whitelist (prevents "pobre", "doente", etc.)
+    ("job", "profissão",
+     _re.compile(
+         r"(?:sou|trabalho como)\s+(?:um |uma )?(" + "|".join(_JOB_WHITELIST) + r")\b",
+         _re.IGNORECASE,
+     )),
 ]
 
 
+def _is_crisis_message(text: str) -> bool:
+    """Return True if the message contains crisis/distress language."""
+    lower = text.lower()
+    return any(kw in lower for kw in _CRISIS_KEYWORDS)
+
+
 def _auto_extract_facts(user_id: str, text: str, mem) -> None:
-    """Extract personal facts from user message using regex patterns and save them."""
+    """Extract personal facts from user message using regex patterns and save them.
+
+    Safety rules:
+    - Never extract facts from crisis/distress messages.
+    - Job extraction only matches whitelisted professions.
+    - Income value is normalised (spaces/commas stripped).
+    """
+    if _is_crisis_message(text):
+        print(f"[memory] skipping extraction — crisis message detected for user {user_id[:8]}")
+        return
+
     for key, _desc, pattern in _FACT_PATTERNS:
         m = pattern.search(text)
         if m:
-            value = m.group(1).strip()
-            if value:
+            value = m.group(1).strip().replace(" ", "").replace(",", ".")
+            # For non-numeric facts, restore spaces (only strip for income)
+            if key != "monthly_income":
+                value = m.group(1).strip()
+            if value and 1 <= len(value) <= 60:
                 mem.save_fact(user_id, key, value)
                 print(f"[memory] auto-saved: {key}={value!r} for user {user_id[:8]}")
 

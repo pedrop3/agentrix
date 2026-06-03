@@ -38,6 +38,14 @@ Answer in {web.language}.
   rag_search(query)                → local text cache [FALLBACK only]
 ────────────────────────────────────────────────────────────────────────────────
 
+── READING USER SELECTION ───────────────────────────────────────────────────────
+  If the question contains "(opção selecionada pelo utilizador: X)", the user
+  explicitly chose X through a clarification step. Treat X as the PRIMARY FOCUS:
+  - Lead your answer with X
+  - Show comparison with alternatives as secondary context only
+  - End with a direct recommendation for X if the question was "qual é melhor"
+────────────────────────────────────────────────────────────────────────────────
+
 Decision flow:
   1. Comparison question (2+ products or "differences between X and Y"):
      → compare_products("Product A, Product B") once.
@@ -48,12 +56,14 @@ Decision flow:
      → kg_neighbors on the confirmed name.
      If KG returns nothing → rag_search.
 
-  3. Structure your answer as a comparison table or clear bullet list.
-     Always cite which products had missing KG data.
+  3. Structure your answer:
+     - If user selected a specific product: lead with it, then brief alternatives.
+     - Otherwise: comparison table or clear bullet list.
+     - Always cite which products had missing KG data.
 
 Hard rules:
 - NEVER call compare_products more than once.
-- NEVER call rag_search more than once.
+- NEVER call rag_search more than once per unique query.
 - NEVER invent fees, rates, conditions, or dates.
 - If data is absent from both KG and RAG, say so explicitly.
 """

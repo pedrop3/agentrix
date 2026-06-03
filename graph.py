@@ -51,14 +51,13 @@ class RouterDecision(BaseModel):
     next: Literal[
         "researcher", "writer", "mathy",
         "faq", "compare", "web",
-        "direct", "clarify", "out_of_scope", "END"
+        "direct", "clarify", "out_of_scope", "crisis", "END"
     ] = Field(
         description=(
             "Which agent should act next, or END if the task is complete. "
-            "Use 'clarify' only when the user asks about a product without specifying "
-            "which variant (e.g. 'o cartão' when Gold/Black/Standard all exist). "
-            "Use 'out_of_scope' when the question has absolutely nothing to do with "
-            "the domain (banking/finance)"
+            "Use 'clarify' only when a product/service is ambiguous. "
+            "Use 'out_of_scope' when the topic has no connection to banking/finance. "
+            "Use 'crisis' when the user expresses self-harm, suicide, or severe distress."
         )
     )
     reason: str = Field(description="Brief reason for the decision (one sentence).")
@@ -117,23 +116,32 @@ Available agents:
                   Do NOT use for vague questions — give them the benefit of the doubt.
 
 Decision rules (in order):
+0. CRISIS FIRST: User expresses thoughts of self-harm, suicide, hopelessness, or severe
+   emotional distress (e.g. "vou me matar", "não quero viver", "quero desaparecer") → "crisis"
+   This rule overrides ALL others. Never route crisis to direct, web, or any other agent.
 1. ANY arithmetic or numbers to compute → "mathy" (MANDATORY, even trivial like "2+2")
 2. SAVE / CREATE / WRITE a note → "writer"
 3. FIND something previously saved → "researcher"
 4. Topic is clearly outside banking/finance (e.g. "what is OOP in Java",
    "who won the World Cup", "recipe for pasta") → "out_of_scope"
-5. Product TYPE is ambiguous (e.g. "cartão", "conta", "seguro" without type) → "clarify"
-6. Comparison between 2+ {web.display_name} products → "compare"
-7. Single {web.display_name} product/FAQ question → "faq" first
+5. Message already contains "(opção selecionada pelo utilizador:...)" (user went through
+   clarification) → do NOT clarify again. Route directly to "compare", "faq", or "web".
+6. Product TYPE is ambiguous (e.g. "cartão", "conta", "seguro" without type) → "clarify"
+   EXCEPTION: if the question is a comparison/recommendation ("qual melhor", "comparar",
+   "diferença") with ambiguous type → still clarify TYPE only, then compare will handle variants.
+7. Comparison between 2+ {web.display_name} products → "compare"
+8. Single {web.display_name} product/FAQ question → "faq" first
    - If last agent was "faq" AND its reply starts with "FAQ_MISS:" → "web"
    - If last agent was "faq" AND it provided a real answer → END
-8. Product VARIANT is ambiguous (e.g. "cartão de crédito" without Gold/Standard/Platinum) → "clarify"
-9. General {web.display_name} question (not a comparison, not a single product FAQ) → "web"
-10. Conversational / greeting / follow-up → "direct"
-11. Previous terminal agent already completed the task → END
+9. Product VARIANT is ambiguous AND the question is NOT a comparison/recommendation → "clarify"
+   NOTE: For comparison/recommendation questions, skip variant clarify — "compare" handles all variants.
+10. General {web.display_name} question (not a comparison, not a single product FAQ) → "web"
+11. Conversational / greeting / follow-up → "direct"
+12. Previous terminal agent already completed the task → END
 
 CRITICAL: NEVER send math to "direct", "faq", "compare", or "web".
 CRITICAL: When in doubt about scope, prefer "direct" over "out_of_scope".
+CRITICAL: Rule 0 (crisis) is absolute and cannot be overridden.
 
 You MUST return valid JSON:
 {{"next": "...", "reason": "...", "clarification_question": null, "clarification_options": null}}
@@ -198,6 +206,16 @@ OUT_OF_SCOPE_MSG = (
     "e não consigo ajudar com esse tema. "
     "Posso responder perguntas sobre contas, cartões, créditos, investimentos "
     "e outros produtos financeiros. Em que posso ajudar?"
+)
+
+CRISIS_MSG = (
+    "Percebo que estás a passar por um momento muito difícil. "
+    "A tua segurança é a prioridade acima de tudo.\n\n"
+    "Se precisares de apoio imediato, podes contactar:\n"
+    "• **SOS Voz Amiga** — 213 544 545 (24h)\n"
+    "• **Linha de Saúde 24** — 808 24 24 24\n"
+    "• **Emergência** — 112\n\n"
+    "Não estás sozinho/a. Há pessoas prontas para ouvir."
 )
 
 
@@ -336,11 +354,19 @@ def build_graph(researcher, writer, mathy, supervisor, direct, faq, compare, web
             "messages": [AIMessage(content=OUT_OF_SCOPE_MSG, name="direct")],
         }
 
+    def crisis_node(state: SupervisorState):
+        """Resposta de crise — nunca usa LLM, resposta canned com recursos de apoio."""
+        print("[crisis] conteúdo de crise detectado — resposta de segurança")
+        return {
+            "messages": [AIMessage(content=CRISIS_MSG, name="direct")],
+        }
+
     workflow = StateGraph(SupervisorState)
     workflow.add_node("supervisor", supervisor_node)
     workflow.add_node("direct", direct_node)
     workflow.add_node("clarify", clarify_node)
     workflow.add_node("out_of_scope", out_of_scope_node)
+    workflow.add_node("crisis", crisis_node)
     workflow.add_node("researcher", _wrap(researcher, "researcher"))
     workflow.add_node("writer", _wrap(writer, "writer"))
     workflow.add_node("mathy", _wrap(mathy, "mathy"))
@@ -363,13 +389,14 @@ def build_graph(researcher, writer, mathy, supervisor, direct, faq, compare, web
             "direct":        "direct",
             "clarify":       "clarify",
             "out_of_scope":  "out_of_scope",
+            "crisis":        "crisis",
             "END":           END,
         },
     )
     # All agents loop back to supervisor; supervisor decides END or next agent.
     # out_of_scope uses name="direct" so supervisor short-circuits to END.
-    for node in ("direct", "clarify", "out_of_scope", "researcher", "writer", "mathy",
-                 "faq", "compare", "web"):
+    for node in ("direct", "clarify", "out_of_scope", "crisis",
+                 "researcher", "writer", "mathy", "faq", "compare", "web"):
         workflow.add_edge(node, "supervisor")
 
     return workflow.compile(checkpointer=checkpointer)
