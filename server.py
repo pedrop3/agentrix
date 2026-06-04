@@ -341,6 +341,7 @@ async def _run_graph_stream(
     """
     run_id = str(uuid.uuid4())
     current_msg_id: str | None = None
+    current_agent: str | None = None
 
     tool_q: asyncio.Queue = asyncio.Queue()
     ctx_token = _tool_event_queue.set(tool_q)
@@ -365,6 +366,14 @@ async def _run_graph_stream(
             node = (metadata or {}).get("langgraph_node")
             if node in ("supervisor", "clarify"):
                 continue
+
+            # Emit which agent is now active so the client can show an indicator
+            # (and render a distinct crisis card when node == "crisis").
+
+            if node and node != current_agent:
+                current_agent = node
+                # AG-UI spec: a lifecycle step -> STEP_STARTED with stepName.
+                yield _sse({"type": "STEP_STARTED", "stepName": node})
 
             # Always flush tool events before any text check so rag_search
             # badges (from faq_agent) appear even when we suppress the text.
@@ -400,7 +409,8 @@ async def _run_graph_stream(
                         "role": "assistant",
                     })
                 yield _sse({
-                    "type": "TEXT_MESSAGE_DELTA",
+                    # AG-UI spec: streaming text chunk is TEXT_MESSAGE_CONTENT.
+                    "type": "TEXT_MESSAGE_CONTENT",
                     "messageId": current_msg_id,
                     "delta": delta,
                 })
@@ -422,7 +432,8 @@ async def _run_graph_stream(
             if all_interrupts:
                 intr_val = all_interrupts[0]
                 print(f"[server] interrupt detected: {intr_val}")
-                yield _sse({"type": "INTERRUPT", **intr_val})
+                # AG-UI spec: app-specific events go through CUSTOM (name + value).
+                yield _sse({"type": "CUSTOM", "name": "interrupt", "value": intr_val})
         except Exception as exc:  # noqa: BLE001
             print(f"[server] aget_state error: {exc}")
 
