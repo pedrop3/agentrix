@@ -341,6 +341,7 @@ async def _run_graph_stream(
     """
     run_id = str(uuid.uuid4())
     current_msg_id: str | None = None
+    current_agent: str | None = None
 
     tool_q: asyncio.Queue = asyncio.Queue()
     ctx_token = _tool_event_queue.set(tool_q)
@@ -365,6 +366,13 @@ async def _run_graph_stream(
             node = (metadata or {}).get("langgraph_node")
             if node in ("supervisor", "clarify"):
                 continue
+
+            # Emit which agent is now active so the client can show an indicator
+            # (and render a distinct crisis card when node == "crisis").
+
+            if node and node != current_agent:
+                current_agent = node
+                yield _sse({"type": "AGENT_ACTIVE", "name": node})
 
             # Always flush tool events before any text check so rag_search
             # badges (from faq_agent) appear even when we suppress the text.
