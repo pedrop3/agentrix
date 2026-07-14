@@ -227,9 +227,17 @@ def build_graph(researcher, writer, mathy, supervisor, direct, faq, compare, web
 
     def supervisor_node(state: SupervisorState):
         last = state["messages"][-1]
-        if getattr(last, "name", None) in _TERMINAL:
+        last_name = getattr(last, "name", None)
+        if last_name in _TERMINAL:
             print("[supervisor] -> END  (terminal agent already responded)")
             return {"next": "END"}
+        if last_name == "faq":
+            content = last.content if isinstance(last.content, str) else str(last.content)
+            if not content.startswith("FAQ_MISS"):
+                print("[supervisor] -> END  (faq already answered)")
+                return {"next": "END"}
+            # FAQ_MISS: fall through to the LLM router. It sees this FAQ_MISS
+            # message and routes to "web" per prompt rule 8.
         # Pra rotear, o supervisor so precisa da MENSAGEM ATUAL do usuario.
         # Mandar todo o historico aqui = prompt enorme e routing igualmente correto.
         # Encolhe drasticamente o prompt do supervisor em conversas longas.

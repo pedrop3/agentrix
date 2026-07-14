@@ -5,6 +5,7 @@ import asyncio
 import json
 import sys
 import uuid
+import re
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Optional
 
@@ -325,6 +326,56 @@ def _streaming_response(generator: AsyncIterator[bytes]) -> StreamingResponse:
         },
     )
 
+_suggest_llm = None
+
+
+def _get_suggest_llm():
+    """Lazy singleton LLM used only for follow-up suggestions."""
+    global _suggest_llm
+    if _suggest_llm is None:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        _suggest_llm = ChatGoogleGenerativeAI(
+            model=config.gemini.model,
+            google_api_key=config.gemini.api_key,
+            temperature=config.gemini.temperature,
+        )
+    return _suggest_llm
+
+
+async def _suggest_followups(question: str, answer: str) -> list[str]:
+    """Gera 3 perguntas de seguimento curtas com sanitização rigorosa."""
+    if not answer.strip():
+        return []
+
+    prompt = (
+        "Com base na pergunta e resposta abaixo, sugere 3 perguntas de seguimento "
+        "curtas (máx. 5 palavras cada). Responde APENAS com as 3, uma por linha, "
+        "sem numeração, sem aspas, sem marcadores.\n\n"
+        f"Pergunta: {question}\nResposta: {answer[:1500]}"
+    )
+
+    try:
+        llm = _get_suggest_llm()
+        resp = await llm.ainvoke(prompt)
+
+        # Normaliza o conteúdo para string
+        content = resp.content
+        if isinstance(content, list):
+            content = " ".join([str(b.get("text", "")) for b in content if isinstance(b, dict)])
+
+        lines = []
+        for line in content.splitlines():
+            clean_line = re.sub(r'^\d+[\.\)]\s*', '', line).strip(" -•*\"'")
+            if clean_line:
+                lines.append(clean_line)
+
+        return lines[:3]
+
+    except Exception as e:
+        print(f"[suggest] Erro na geração: {e}")
+        return []
+
+
 
 async def _run_graph_stream(
     graph,
@@ -332,6 +383,7 @@ async def _run_graph_stream(
     run_config: dict,
     conversation_id: str,
     request: Optional[Request] = None,
+    question: str = "",
 ):
     """Shared SSE generator for both /chat/stream and /chat/resume.
 
@@ -342,6 +394,7 @@ async def _run_graph_stream(
     run_id = str(uuid.uuid4())
     current_msg_id: str | None = None
     current_agent: str | None = None
+    answer_buf: list[str] = []   # accumulates assistant text for follow-up suggestions
 
     tool_q: asyncio.Queue = asyncio.Queue()
     ctx_token = _tool_event_queue.set(tool_q)
@@ -408,6 +461,7 @@ async def _run_graph_stream(
                         "messageId": current_msg_id,
                         "role": "assistant",
                     })
+                answer_buf.append(delta)
                 yield _sse({
                     # AG-UI spec: streaming text chunk is TEXT_MESSAGE_CONTENT.
                     "type": "TEXT_MESSAGE_CONTENT",
@@ -436,6 +490,13 @@ async def _run_graph_stream(
                 yield _sse({"type": "CUSTOM", "name": "interrupt", "value": intr_val})
         except Exception as exc:  # noqa: BLE001
             print(f"[server] aget_state error: {exc}")
+            all_interrupts = []
+
+        # ── Contextual follow-up suggestions (only on a real answer) ──────────
+        if not all_interrupts and answer_buf:
+            items = await _suggest_followups(question, "".join(answer_buf))
+            if items:
+                yield _sse({"type": "CUSTOM", "name": "suggestions", "value": {"items": items}})
 
         yield _sse({"type": "RUN_FINISHED", "runId": run_id, "threadId": conversation_id})
 
@@ -458,9 +519,10 @@ async def chat_stream(body: ChatBody, request: Request):
     reset_steps()
     run_config = _config_for(body)
     user_msg = _build_user_message(body)
+    question = body.messages[-1].content if body.messages else ""
 
     return _streaming_response(
-        _run_graph_stream(graph, {"messages": [user_msg]}, run_config, body.conversationId, request)
+        _run_graph_stream(graph, {"messages": [user_msg]}, run_config, body.conversationId, request, question)
     )
 
 
