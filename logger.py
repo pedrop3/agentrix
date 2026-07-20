@@ -6,6 +6,7 @@ import re
 import textwrap
 import threading
 import time
+import uuid
 from collections import defaultdict
 from contextvars import ContextVar
 
@@ -157,6 +158,21 @@ def _fmt_tool_input(input_str: str) -> str:
     except (ValueError, SyntaxError):
         pass
     return textwrap.shorten(str(input_str), width=W - 18, placeholder="…")
+
+
+def _tool_args_json(input_str: str) -> str:
+    """Normalize tool args (JSON or Python-dict repr) into a valid JSON string
+    for the AG-UI TOOL_CALL_ARGS delta."""
+    try:
+        return json.dumps(json.loads(input_str), ensure_ascii=False)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    try:
+        import ast
+        return json.dumps(ast.literal_eval(input_str), ensure_ascii=False)
+    except (ValueError, SyntaxError):
+        pass
+    return json.dumps(str(input_str), ensure_ascii=False)
 
 
 def _extract_text(raw) -> str:
@@ -316,6 +332,11 @@ class LLMLogger(BaseCallbackHandler):
         q = _tool_event_queue.get()
         if q is not None:
             q.put_nowait({"type": "TOOL_CALL_START", "toolCallId": run_id, "toolCallName": name})
+            q.put_nowait({
+                "type": "TOOL_CALL_ARGS",
+                "toolCallId": run_id,
+                "delta": _tool_args_json(str(input_str)),
+            })
 
     def on_tool_end(self, output, **kwargs):
         run_id = str(kwargs.get("run_id", ""))
@@ -345,6 +366,13 @@ class LLMLogger(BaseCallbackHandler):
         # AG-UI: emitir evento para o stream SSE
         q = _tool_event_queue.get()
         if q is not None:
+            q.put_nowait({
+                "type": "TOOL_CALL_RESULT",
+                "messageId": str(uuid.uuid4()),
+                "toolCallId": run_id,
+                "content": _extract_text(output),
+                "role": "tool",
+            })
             q.put_nowait({"type": "TOOL_CALL_END", "toolCallId": run_id})
 
     def on_tool_error(self, error, **kwargs):
@@ -355,6 +383,13 @@ class LLMLogger(BaseCallbackHandler):
         # AG-UI: fechar a tool call mesmo em caso de erro
         q = _tool_event_queue.get()
         if q is not None:
+            q.put_nowait({
+                "type": "TOOL_CALL_RESULT",
+                "messageId": str(uuid.uuid4()),
+                "toolCallId": run_id,
+                "content": str(error),
+                "role": "tool",
+            })
             q.put_nowait({"type": "TOOL_CALL_END", "toolCallId": run_id})
 
 

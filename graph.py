@@ -21,6 +21,24 @@ from logger import LLMLogger, ToolOnlyLogger, get_logger
 DIRECT_HISTORY_LIMIT = 6
 
 
+def _flatten_content(content) -> str:
+    """Normalize a message's .content to plain text.
+
+    Gemini sometimes returns content as a list of blocks
+    (e.g. [{"type": "text", "text": "..."}]) instead of a plain string.
+    Callers that do string ops on content (startswith, etc.) need this —
+    str(list) would stringify the block structure, not the text.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            b.get("text", "") if isinstance(b, dict) else str(b)
+            for b in content
+        )
+    return str(content)
+
+
 def _inject_no_think(messages: list) -> list:
     """
     Anexa ' /no_think' ao final da ULTIMA HumanMessage da lista (qwen3 so
@@ -232,7 +250,7 @@ def build_graph(researcher, writer, mathy, supervisor, direct, faq, compare, web
             print("[supervisor] -> END  (terminal agent already responded)")
             return {"next": "END"}
         if last_name == "faq":
-            content = last.content if isinstance(last.content, str) else str(last.content)
+            content = _flatten_content(last.content)
             if not content.startswith("FAQ_MISS"):
                 print("[supervisor] -> END  (faq already answered)")
                 return {"next": "END"}
@@ -350,7 +368,7 @@ def build_graph(researcher, writer, mathy, supervisor, direct, faq, compare, web
             result = await sub_agent.ainvoke({"messages": messages}, invoke_cfg or None)
             last = result["messages"][-1]
             return {
-                "messages": [AIMessage(content=last.content, name=name)],
+                "messages": [AIMessage(content=_flatten_content(last.content), name=name)],
             }
 
         return node

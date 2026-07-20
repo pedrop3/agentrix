@@ -424,6 +424,9 @@ async def _run_graph_stream(
             # (and render a distinct crisis card when node == "crisis").
 
             if node and node != current_agent:
+                if current_agent:
+                    # AG-UI spec: close the previous lifecycle step before opening a new one.
+                    yield _sse({"type": "STEP_FINISHED", "stepName": current_agent})
                 current_agent = node
                 # AG-UI spec: a lifecycle step -> STEP_STARTED with stepName.
                 yield _sse({"type": "STEP_STARTED", "stepName": node})
@@ -432,13 +435,6 @@ async def _run_graph_stream(
             # badges (from faq_agent) appear even when we suppress the text.
             for ev in _drain_tool_queue():
                 yield _sse(ev)
-
-            # Suppress FAQ_MISS routing signals — internal signal from faq_agent
-            # that the cache was empty. The supervisor re-routes to web_agent;
-            # the user should never see this intermediate "FAQ_MISS: ..." text.
-            raw_preview = getattr(chunk, "content", "") or ""
-            if isinstance(raw_preview, str) and raw_preview.startswith("FAQ_MISS"):
-                continue
 
             raw = getattr(chunk, "content", "") or ""
             if not isinstance(raw, str):
@@ -452,6 +448,9 @@ async def _run_graph_stream(
                     delta = ""
             else:
                 delta = raw
+
+            if delta.startswith("FAQ_MISS"):
+                continue
 
             if delta:
                 if current_msg_id is None:
@@ -474,6 +473,10 @@ async def _run_graph_stream(
 
         if current_msg_id:
             yield _sse({"type": "TEXT_MESSAGE_END", "messageId": current_msg_id})
+
+        if current_agent:
+            # AG-UI spec: close the last lifecycle step once the run's graph loop ends.
+            yield _sse({"type": "STEP_FINISHED", "stepName": current_agent})
 
         # ── Check for pending interrupt (e.g. clarify node paused the graph) ──
         try:
@@ -507,6 +510,8 @@ async def _run_graph_stream(
             yield _sse(ev)
         if current_msg_id:
             yield _sse({"type": "TEXT_MESSAGE_END", "messageId": current_msg_id})
+        if current_agent:
+            yield _sse({"type": "STEP_FINISHED", "stepName": current_agent})
         yield _sse({"type": "RUN_ERROR", "runId": run_id, "message": str(exc)})
     finally:
         _tool_event_queue.reset(ctx_token)
